@@ -280,6 +280,49 @@ def analyze(team_url: Optional[str], usta_url: Optional[str], output_csv: Option
 
         history_text = format_history_for_prompt(get_recent_records(3))
 
+        # Verify the correct upcoming match before running the expensive analysis
+        import datetime as _dt2
+        from tennisai.tools.usta import USTAClient as _USTACheck
+        try:
+            _chk = _USTACheck()
+            _upcoming, _ = _chk.get_schedule_and_results(usta_url)
+            _chk.close()
+            today = _dt2.date.today()
+            _future = [m for m in _upcoming if m.date and m.date >= today]
+            if not _future:
+                click.echo(
+                    "\nNo upcoming match found on USTA TennisLink. "
+                    "The schedule may not be published yet for your team.",
+                    err=True,
+                )
+                sys.exit(1)
+
+            if len(_future) == 1:
+                _next = _future[0]
+                click.echo(f"\n  Next match: {_next.date} — {_next.home_team} vs {_next.away_team}")
+                if _next.location:
+                    click.echo(f"  Location:   {_next.location}")
+                if not click.confirm("\n  Is this the correct match to analyze?", default=True):
+                    click.echo("Cancelled. Check your USTA_TEAM_URL in .env.", err=True)
+                    sys.exit(1)
+            else:
+                # Multiple upcoming matches — let the user pick
+                click.echo(f"\n  {len(_future)} upcoming matches found:")
+                for i, m in enumerate(_future, 1):
+                    click.echo(f"  {i}. {m.date} — {m.home_team} vs {m.away_team}" +
+                               (f"  @ {m.location}" if m.location else ""))
+                while True:
+                    raw = click.prompt("  Select match number").strip()
+                    if raw.isdigit() and 1 <= int(raw) <= len(_future):
+                        _next = _future[int(raw) - 1]
+                        break
+                    click.echo(f"  Enter a number between 1 and {len(_future)}.")
+
+        except SystemExit:
+            raise
+        except Exception:
+            pass  # If the check fails, let the agent try anyway
+
         click.echo("\nAnalyzing match... (this may take a moment)")
         analysis = run_analysis(
             my_team_url=team_url,

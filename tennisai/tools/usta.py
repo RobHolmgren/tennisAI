@@ -17,7 +17,7 @@ import re
 import datetime
 from typing import Optional
 
-from tennisai.config import get_usta_credentials
+from tennisai.config import get_my_team_name, get_usta_credentials
 from tennisai.models import CourtTrend, Match, MatchFormat, MatchResult
 
 # How long (ms) to wait for the login redirect back to tennislink after submitting credentials
@@ -400,10 +400,10 @@ def _parse_from_html(html: str) -> tuple[list[Match], list[MatchResult]]:
             if not d or not (home or away):
                 continue
 
-            if "Enter Score" in action or "Print Blank Score" in action:
-                # Upcoming match
+            is_completed = "View Score" in action and "Enter Score" not in action
+            # Include as upcoming if: action says so, OR date is in the future and not already scored
+            if "Enter Score" in action or "Print Blank Score" in action or (d >= today and not is_completed):
                 upcoming.append(Match(date=d, home_team=home, away_team=away, location=facility))
-            # "View Score" only = completed, handled in match summary section below
 
     # --- Match Summary (results with scores) ---
     summary_panel = soup.find("div", id=lambda x: x and "matchsummary" in x.lower()
@@ -421,7 +421,7 @@ def _parse_from_html(html: str) -> tuple[list[Match], list[MatchResult]]:
             if not d:
                 continue
             # Determine which side is "us" based on our team name
-            our_team = "RBW-Long Shots"
+            our_team = get_my_team_name()
             is_home = our_team.lower() in home.lower()
             opponent = away if is_home else home
             won = _parse_win(None, score_raw)
@@ -444,7 +444,7 @@ def _parse_from_html(html: str) -> tuple[list[Match], list[MatchResult]]:
             away = _clean_team(cells[13])
             if not d:
                 continue
-            our_team = "RBW-Long Shots"
+            our_team = get_my_team_name()
             is_home = our_team.lower() in home.lower()
             opponent = away if is_home else home
             results.append(MatchResult(date=d, opponent=opponent,

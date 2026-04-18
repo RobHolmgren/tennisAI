@@ -47,6 +47,10 @@ def get_scoring_format() -> str:
     )
 
 
+def get_my_team_name() -> str:
+    return os.getenv("MY_TEAM_NAME", "")
+
+
 def get_singles_courts_override() -> Optional[int]:
     """Returns the configured singles court count if SINGLES_COURTS is set in .env, else None."""
     val = os.getenv("SINGLES_COURTS")
