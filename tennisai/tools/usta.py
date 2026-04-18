@@ -492,7 +492,7 @@ def _parse_match_format(html: str) -> "MatchFormat":
     from tennisai.models import MatchFormat
 
     text = html.lower()
-    singles = 3
+    singles = 2
     doubles = 3
 
     # Look for explicit format text, e.g. "format: 2 singles, 3 doubles"

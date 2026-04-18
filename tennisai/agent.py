@@ -10,9 +10,9 @@ tool calls come back in message.tool_calls[], and results go back as role="tool"
 import datetime
 import json
 import re
-from typing import Any
+from typing import Any, Optional
 
-from tennisai.config import get_ai_provider, get_groq_api_key, get_anthropic_api_key
+from tennisai.config import get_ai_provider, get_groq_api_key, get_anthropic_api_key, get_scoring_format
 from tennisai.models import CourtPrediction, Match, MatchAnalysis, Player, Team
 from tennisai.tools.tennisrecord import get_league_teams, get_player_history, get_team_ratings
 from tennisai.tools.usta import USTAClient
@@ -145,16 +145,28 @@ _CLAUDE_TOOLS = [
 # Tool dispatcher (shared)
 # ---------------------------------------------------------------------------
 
+def _slim_team(team) -> dict:
+    """Return team data without profile_url/team fields to save tokens."""
+    return {
+        "name": team.name,
+        "url": team.url,
+        "players": [
+            {"name": p.name, "ntrp_level": p.ntrp_level, "rating": p.rating, "profile_url": p.profile_url}
+            for p in team.players
+        ],
+    }
+
+
 def _dispatch_tool(name: str, inputs: dict[str, Any]) -> str:
     if name == "get_my_team_ratings":
-        return get_team_ratings(inputs["team_url"]).model_dump_json()
+        return json.dumps(_slim_team(get_team_ratings(inputs["team_url"])))
 
     if name == "get_league_teams":
         teams = get_league_teams(inputs["team_url"])
-        return json.dumps([t.model_dump() for t in teams])
+        return json.dumps([{"name": t.name, "url": t.url} for t in teams])
 
     if name == "get_opponent_ratings":
-        return get_team_ratings(inputs["team_url"]).model_dump_json()
+        return json.dumps(_slim_team(get_team_ratings(inputs["team_url"])))
 
     if name == "get_usta_data":
         client = USTAClient()
@@ -183,76 +195,79 @@ def _dispatch_tool(name: str, inputs: dict[str, Any]) -> str:
 # Shared prompts
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = (
-    "You are a tennis match analyst helping a USTA adult league team captain prepare for their next match. "
-    "Use the available tools to gather player ratings, schedule data, court trends, and player history, "
-    "then produce a detailed court-by-court match prediction.\n\n"
-    "Rating guidance: each player has two values from tennisrecord.com:\n"
-    "  - ntrp_level: the official NTRP band (e.g. 3.0, 3.5) — coarse-grained\n"
-    "  - rating: the estimated current rating within that band, shown to 2 decimal places (e.g. 2.98) — "
-    "this is the high-priority predictor. A player with rating 3.12 is meaningfully stronger than one at 2.94 "
-    "even if both are NTRP 3.0. Always use the estimated rating as the primary basis for predictions; "
-    "fall back to ntrp_level only when the estimated rating is missing.\n\n"
-    "Prediction factors — always consider ALL of these:\n"
-    "  1. Player ratings from tennisrecord.com (primary factor)\n"
-    "  2. Per-court trends: if a team consistently wins or loses a specific court position, weight that heavily\n"
-    "  3. Individual player win/loss streaks and recent form (last 6 months, including matches outside this team)\n"
-    "  4. Predicted opponent lineup: rank their players by rating and assign them to courts most-to-least "
-    "likely based on strength ordering and any historical court assignments you can infer\n"
-    "  5. Lineup optimization: review the captain's tentative lineup and suggest specific changes "
-    "(player swaps, court reassignments) that would maximize the team's win probability\n"
-    "  6. Team match priority: the goal is to win the overall team match (majority of courts), not to "
-    "maximise individual court wins. If sacrificing a likely-loss court improves chances elsewhere, recommend it. "
-    "Frame all lineup suggestions around this team-first objective.\n"
-    "  7. Court difficulty weighting: Court 1 (singles or doubles) is the hardest and most valuable. "
-    "Weight a win or loss at Court 1 more heavily than Court 2, and Court 2 more than Court 3. "
-    "Prioritise fielding stronger players at lower-numbered courts.\n\n"
-    "When you have all the data you need, provide a final analysis — do not ask follow-up questions."
-)
+def _build_system_prompt() -> str:
+    scoring = get_scoring_format()
+    return (
+        "You are a USTA adult league tennis analyst. Use tools to gather data, then predict court outcomes.\n\n"
+        f"Scoring format: {scoring}. "
+        "Predict scores like '6-3 6-2' or '4-6 6-3 [10-7]'. First number in each set = our score.\n\n"
+        "Ratings: use 'rating' (2-decimal, e.g. 2.98) as primary predictor; fall back to ntrp_level only if missing. "
+        "3.12 beats 2.94 even if both are NTRP 3.0.\n\n"
+        "Weigh these factors: (1) ratings, (2) per-court win/loss trends, (3) player form last 6 months, "
+        "(4) predicted opponent lineup strongest-to-weakest by court, (5) lineup changes to maximise team wins. "
+        "Goal is team match victory (most courts), not individual courts. "
+        "Court 1 > Court 2 > Court 3 in difficulty and importance — put stronger players lower-numbered.\n\n"
+        "Provide final analysis without asking follow-up questions."
+    )
+
+
+_SYSTEM_PROMPT = _build_system_prompt()
 
 _OUTPUT_SCHEMA = (
-    "Return your final analysis as a JSON object:\n"
+    "Return JSON only — no prose outside the JSON block:\n"
     "{\n"
-    '  "match": {"date": "YYYY-MM-DD", "home_team": "...", "away_team": "...", "location": "..."},\n'
-    '  "my_team": {"name": "...", "url": "...", "players": [{"name": "...", "ntrp_level": 3.0, "rating": 2.94}]},\n'
-    '  "opponent_team": {"name": "...", "url": "...", "players": [{"name": "...", "ntrp_level": 3.0, "rating": 2.98}]},\n'
-    '  "my_recent_results": [{"date": "YYYY-MM-DD", "opponent": "...", "score": "3-2", "won": true}],\n'
-    '  "opponent_recent_results": [{"date": "YYYY-MM-DD", "opponent": "...", "score": "1-4", "won": false}],\n'
+    '  "match": {"date": "YYYY-MM-DD", "home_team": "", "away_team": "", "location": ""},\n'
+    '  "my_team": {"name": "", "url": "", "players": [{"name": "", "ntrp_level": 3.0, "rating": 2.94}]},\n'
+    '  "opponent_team": {"name": "", "url": "", "players": [{"name": "", "ntrp_level": 3.0, "rating": 2.98}]},\n'
     '  "predictions": [\n'
-    '    {"court": 1, "court_type": "Singles", "my_players": ["..."], "opponent_players": ["..."],\n'
-    '     "predicted_winner": "us", "confidence": "high",\n'
-    '     "reasoning": "... include rating comparison, court trend, and player form factors ..."}\n'
+    '    {"court": 1, "court_type": "Singles", "my_players": [""], "opponent_players": [""],\n'
+    '     "predicted_winner": "us", "predicted_score": "6-3 6-2", "confidence": "high", "reasoning": ""}\n'
     "  ],\n"
-    '  "overall_outlook": "... include team form, momentum, key match-ups ...",\n'
-    '  "lineup_suggestions": [\n'
-    '    "Consider moving Player A from Court 2 Singles to Court 1 Singles — higher rating (3.12 vs 2.94).",\n'
-    '    "Pair Player B and Player C at Doubles 1 — combined rating is highest vs weakest opponent court."\n'
-    "  ]\n"
+    '  "overall_outlook": "",\n'
+    '  "lineup_suggestions": [""]\n'
     "}"
 )
 
 
-def _build_user_message(my_team_url: str, usta_team_url: str, lineup: dict[str, list[str]]) -> str:
+def _build_user_message(
+    my_team_url: str,
+    usta_team_url: str,
+    lineup: dict[str, list[str]],
+    opponent_lineup: dict[str, list[str]],
+    history_text: str,
+    singles_courts: int = 2,
+    doubles_courts: int = 3,
+) -> str:
     lineup_text = "\n".join(f"  {court}: {', '.join(players)}" for court, players in lineup.items())
-    return (
-        f"Please analyze our next match and predict the outcome for each court.\n\n"
-        f"Our team's tennisrecord.com URL: {my_team_url}\n"
-        f"Our USTA TennisLink URL: {usta_team_url}\n\n"
-        f"Our tentative lineup:\n{lineup_text}\n\n"
-        "Steps to follow:\n"
-        "1. Fetch our team's player ratings from tennisrecord.com (note profile_url for each player)\n"
-        "2. Call get_usta_data to get our next match date/opponent AND our recent match results\n"
-        "3. Call get_court_trends to get our per-court win/loss history from match scorecards\n"
-        "4. Find our league teams and identify the opponent's tennisrecord.com URL from the next match\n"
-        "5. Fetch the opponent's player ratings\n"
-        "6. For each player in our lineup who has a profile_url, call get_player_history to get their "
-        "recent form over the last 6 months\n"
+
+    opponent_section = ""
+    if opponent_lineup:
+        opp_text = "\n".join(f"  {court}: {', '.join(players)}" for court, players in opponent_lineup.items())
+        opponent_section = (
+            f"The opponent's confirmed lineup (use this instead of predicting their lineup):\n{opp_text}\n\n"
+        )
+
+    history_section = f"\n{history_text}\n\n" if history_text else ""
+
+    opponent_lineup_step = (
+        "7. The opponent's lineup is already known (provided above) — use it directly, skip prediction step\n"
+        if opponent_lineup else
         "7. Predict the opponent's most likely lineup by ranking their players strongest-to-weakest "
         "and assigning them to courts accordingly\n"
-        "8. Compare our lineup against the predicted opponent lineup, factoring in ratings, "
-        "per-court trends, and individual player form — predict each court result\n"
-        "9. Review the tentative lineup and suggest specific changes to maximize our win chances\n"
-        "10. Provide an overall match outlook\n\n"
+    )
+
+    court_format = f"MATCH FORMAT: {singles_courts} Singles courts + {doubles_courts} Doubles courts = {singles_courts + doubles_courts} courts total. Do NOT predict any other courts."
+
+    return (
+        f"Analyze our next match. tennisrecord URL: {my_team_url} | USTA URL: {usta_team_url}\n\n"
+        f"{court_format}\n\n"
+        f"Our lineup:\n{lineup_text}\n\n"
+        f"{opponent_section}"
+        f"{history_section}"
+        "Steps: 1) get_my_team_ratings 2) get_usta_data 3) get_court_trends "
+        "4) get_league_teams then get_opponent_ratings 5) get_player_history for each of our players "
+        f"6) {opponent_lineup_step.strip()} "
+        "7) predict each court with score 8) suggest lineup changes 9) overall outlook\n\n"
         + _OUTPUT_SCHEMA
     )
 
@@ -261,13 +276,21 @@ def _build_user_message(my_team_url: str, usta_team_url: str, lineup: dict[str, 
 # Groq agent loop
 # ---------------------------------------------------------------------------
 
-def _run_groq(my_team_url: str, usta_team_url: str, lineup: dict[str, list[str]]) -> MatchAnalysis:
+def _run_groq(
+    my_team_url: str,
+    usta_team_url: str,
+    lineup: dict[str, list[str]],
+    opponent_lineup: dict[str, list[str]],
+    history_text: str,
+    singles_courts: int,
+    doubles_courts: int,
+) -> MatchAnalysis:
     from groq import Groq
 
     client = Groq(api_key=get_groq_api_key())
     messages: list[dict] = [
         {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": _build_user_message(my_team_url, usta_team_url, lineup)},
+        {"role": "user", "content": _build_user_message(my_team_url, usta_team_url, lineup, opponent_lineup, history_text, singles_courts, doubles_courts)},
     ]
 
     for _ in range(MAX_ITERATIONS):
@@ -307,12 +330,20 @@ def _run_groq(my_team_url: str, usta_team_url: str, lineup: dict[str, list[str]]
 # Claude agent loop
 # ---------------------------------------------------------------------------
 
-def _run_claude(my_team_url: str, usta_team_url: str, lineup: dict[str, list[str]]) -> MatchAnalysis:
+def _run_claude(
+    my_team_url: str,
+    usta_team_url: str,
+    lineup: dict[str, list[str]],
+    opponent_lineup: dict[str, list[str]],
+    history_text: str,
+    singles_courts: int,
+    doubles_courts: int,
+) -> MatchAnalysis:
     import anthropic
 
     client = anthropic.Anthropic(api_key=get_anthropic_api_key())
     messages: list[dict] = [
-        {"role": "user", "content": _build_user_message(my_team_url, usta_team_url, lineup)},
+        {"role": "user", "content": _build_user_message(my_team_url, usta_team_url, lineup, opponent_lineup, history_text, singles_courts, doubles_courts)},
     ]
 
     for _ in range(MAX_ITERATIONS):
@@ -358,12 +389,17 @@ def run_analysis(
     my_team_url: str,
     usta_team_url: str,
     lineup: dict[str, list[str]],
+    opponent_lineup: Optional[dict[str, list[str]]] = None,
+    history_text: str = "",
+    singles_courts: int = 2,
+    doubles_courts: int = 3,
 ) -> MatchAnalysis:
+    opp = opponent_lineup or {}
     provider = get_ai_provider()
     if provider == "groq":
-        return _run_groq(my_team_url, usta_team_url, lineup)
+        return _run_groq(my_team_url, usta_team_url, lineup, opp, history_text, singles_courts, doubles_courts)
     if provider == "claude":
-        return _run_claude(my_team_url, usta_team_url, lineup)
+        return _run_claude(my_team_url, usta_team_url, lineup, opp, history_text, singles_courts, doubles_courts)
     raise NotImplementedError(
         f"AI provider '{provider}' is not implemented. Supported: 'groq', 'claude'."
     )

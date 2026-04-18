@@ -38,6 +38,7 @@ class CourtPrediction(BaseModel):
     my_players: list[str]
     opponent_players: list[str]
     predicted_winner: str  # "us" or "them"
+    predicted_score: str = ""  # e.g. "6-3 6-2" or "4-6 6-3 [10-7]"
     confidence: str  # "high", "medium", "low"
     reasoning: str
 
@@ -63,6 +64,26 @@ class PlayerHistory(BaseModel):
 class MatchFormat(BaseModel):
     singles_courts: int = 3      # 1, 2, or 3
     doubles_courts: int = 3      # always 3 per USTA adult league rules
+
+
+class CourtResult(BaseModel):
+    court: int
+    court_type: str   # "Singles" or "Doubles"
+    winner: str       # "us" or "them"
+    score: str = ""   # e.g. "6-3 6-4"
+
+
+class MatchRecord(BaseModel):
+    id: str
+    recorded_at: str                          # ISO datetime string
+    match_date: Optional[datetime.date] = None
+    opponent: str = ""
+    our_lineup: dict[str, list[str]] = {}     # court_label → player names
+    opponent_lineup: dict[str, list[str]] = {}
+    predictions: list["CourtPrediction"] = []
+    actual_results: list[CourtResult] = []    # filled in after the match
+    overall_predicted: str = ""               # "win" / "loss" / "unknown"
+    overall_actual: Optional[str] = None      # "win" / "loss" — set post-match
 
 
 class MatchAnalysis(BaseModel):

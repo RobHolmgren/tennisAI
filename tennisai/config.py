@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
@@ -37,3 +38,21 @@ def get_my_team_url() -> str:
 
 def get_usta_team_url() -> str:
     return _require("USTA_TEAM_URL")
+
+
+def get_scoring_format() -> str:
+    return os.getenv(
+        "SCORING_FORMAT",
+        "2 sets (tiebreak at 6-6); super tiebreak to 10 if sets split 1-1",
+    )
+
+
+def get_singles_courts_override() -> Optional[int]:
+    """Returns the configured singles court count if SINGLES_COURTS is set in .env, else None."""
+    val = os.getenv("SINGLES_COURTS")
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return None

@@ -1,5 +1,6 @@
 .env
 requirements.md
+.match_history.json
 __pycache__/
 *.py[cod]
 *.egg-info/

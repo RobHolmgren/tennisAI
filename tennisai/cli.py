@@ -16,8 +16,9 @@ from typing import Optional
 import click
 
 from tennisai.agent import run_analysis
-from tennisai.config import get_my_team_url, get_usta_team_url
-from tennisai.models import MatchAnalysis
+from tennisai.config import get_singles_courts_override, get_my_team_url, get_usta_team_url
+from tennisai.models import CourtResult, MatchAnalysis
+from tennisai.tools.history import format_history_for_prompt, get_recent_records, record_prediction, update_result
 
 
 def _resolve_team_url(option_value: Optional[str]) -> str:
@@ -77,6 +78,47 @@ def _collect_lineup(roster: list[str], court_slots: list[tuple[str, int]]) -> di
     return lineup
 
 
+def _collect_opponent_lineup(
+    opponent_roster: list[str],
+    court_slots: list[tuple[str, int]],
+) -> dict[str, list[str]]:
+    """
+    Optionally collect the opponent's known lineup.
+    Returns an empty dict if the captain skips this step.
+    """
+    click.echo("\n--- Opponent lineup (optional) ---")
+    click.echo("If you know who they're playing, enter it now to improve predictions.")
+    if not click.confirm("  Do you know the opponent's lineup?", default=False):
+        return {}
+
+    if opponent_roster:
+        click.echo("\n  Opponent roster:")
+        for i, name in enumerate(opponent_roster, 1):
+            click.echo(f"  {i:>2}. {name}")
+        click.echo()
+
+    lineup: dict[str, list[str]] = {}
+    for court_label, player_count in court_slots:
+        players: list[str] = []
+        for i in range(1, player_count + 1):
+            label = f"{court_label} - Player {i}" if player_count > 1 else court_label
+            while True:
+                raw = click.prompt(f"  {label}", default="", show_default=False).strip()
+                if not raw:
+                    break
+                if opponent_roster and raw.isdigit() and 1 <= int(raw) <= len(opponent_roster):
+                    players.append(opponent_roster[int(raw) - 1])
+                    break
+                if not raw.isdigit():
+                    players.append(raw)
+                    break
+                click.echo(f"  Enter a number 1-{len(opponent_roster)}, a name, or press Enter to skip.")
+        if players:
+            lineup[court_label] = players
+
+    return lineup
+
+
 def _print_analysis(analysis: MatchAnalysis) -> None:
     """Print a formatted match analysis to stdout."""
     m = analysis.match
@@ -98,11 +140,12 @@ def _print_analysis(analysis: MatchAnalysis) -> None:
             players_us = ", ".join(pred.my_players) or "TBD"
             players_them = ", ".join(pred.opponent_players) or "TBD"
             winner = "US" if pred.predicted_winner.lower() == "us" else "THEM"
+            score_str = f"  {pred.predicted_score}" if pred.predicted_score else ""
             click.echo(
                 f"\nCourt {pred.court} {pred.court_type}"
                 f"\n  Us:     {players_us}"
                 f"\n  Them:   {players_them}"
-                f"\n  Pick:   {winner} ({pred.confidence} confidence)"
+                f"\n  Pick:   {winner}{score_str} ({pred.confidence} confidence)"
                 f"\n  Why:    {pred.reasoning}"
             )
 
@@ -124,7 +167,7 @@ def _write_csv(analysis: MatchAnalysis, path: str) -> None:
     with open(pred_path, "w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "court", "court_type", "my_players", "opponent_players",
-            "predicted_winner", "confidence", "reasoning",
+            "predicted_winner", "predicted_score", "confidence", "reasoning",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -135,6 +178,7 @@ def _write_csv(analysis: MatchAnalysis, path: str) -> None:
                 "my_players": "; ".join(pred.my_players),
                 "opponent_players": "; ".join(pred.opponent_players),
                 "predicted_winner": pred.predicted_winner,
+                "predicted_score": pred.predicted_score,
                 "confidence": pred.confidence,
                 "reasoning": pred.reasoning,
             })
@@ -186,17 +230,22 @@ def analyze(team_url: Optional[str], usta_url: Optional[str], output_csv: Option
         if not roster:
             click.echo("Could not fetch roster — you can still type player names directly.\n")
 
-        click.echo("Fetching match format from USTA TennisLink...")
-        try:
-            usta_client = USTAClient()
-            match_format = usta_client.get_match_format(usta_url)
-            usta_client.close()
-            singles = match_format.singles_courts
-            doubles = match_format.doubles_courts
-            click.echo(f"  Match format: {singles} Singles, {doubles} Doubles")
-        except Exception:
-            singles, doubles = 3, 3
-            click.echo("  Could not detect format — assuming 3 Singles, 3 Doubles.")
+        singles_override = get_singles_courts_override()
+        if singles_override is not None:
+            singles, doubles = singles_override, 3
+            click.echo(f"  Match format: {singles} Singles, {doubles} Doubles (from .env)")
+        else:
+            click.echo("Fetching match format from USTA TennisLink...")
+            try:
+                usta_client = USTAClient()
+                match_format = usta_client.get_match_format(usta_url)
+                usta_client.close()
+                singles = match_format.singles_courts
+                doubles = match_format.doubles_courts
+                click.echo(f"  Match format: {singles} Singles, {doubles} Doubles")
+            except Exception:
+                singles, doubles = 2, 3
+                click.echo(f"  Could not detect format — defaulting to {singles} Singles, {doubles} Doubles.")
 
         court_slots = _build_court_slots(singles, doubles)
         lineup = _collect_lineup(roster, court_slots)
@@ -204,14 +253,48 @@ def analyze(team_url: Optional[str], usta_url: Optional[str], output_csv: Option
             click.echo("No lineup entered. At least one court must have a player assigned.", err=True)
             sys.exit(1)
 
+        # Fetch opponent roster for lineup input (best-effort — agent will scrape ratings regardless)
+        opponent_roster: list[str] = []
+        try:
+            from tennisai.tools.tennisrecord import get_league_teams, get_team_ratings
+            from tennisai.tools.usta import USTAClient
+            usta_tmp = USTAClient()
+            upcoming, _ = usta_tmp.get_schedule_and_results(usta_url)
+            usta_tmp.close()
+            import datetime as _dt
+            next_match = next((m for m in upcoming if m.date and m.date >= _dt.date.today()), None)
+            if next_match:
+                opp_name = (next_match.away_team if "long shots" not in (next_match.home_team or "").lower()
+                            else next_match.home_team)
+                league_teams = get_league_teams(team_url)
+                opp_team_obj = next(
+                    (t for t in league_teams if opp_name.lower()[:10] in t.name.lower()), None
+                )
+                if opp_team_obj:
+                    opp_team = get_team_ratings(opp_team_obj.url)
+                    opponent_roster = [p.name for p in opp_team.players]
+        except Exception:
+            pass
+
+        opponent_lineup = _collect_opponent_lineup(opponent_roster, court_slots)
+
+        history_text = format_history_for_prompt(get_recent_records(3))
+
         click.echo("\nAnalyzing match... (this may take a moment)")
         analysis = run_analysis(
             my_team_url=team_url,
             usta_team_url=usta_url,
             lineup=lineup,
+            opponent_lineup=opponent_lineup,
+            history_text=history_text,
+            singles_courts=singles,
+            doubles_courts=doubles,
         )
 
         _print_analysis(analysis)
+
+        match_record = record_prediction(analysis, lineup, opponent_lineup)
+        click.echo(f"Prediction saved (ID: {match_record.id}). Use 'record-result --id {match_record.id}' after the match.")
 
         if output_csv:
             _write_csv(analysis, output_csv)
@@ -332,6 +415,71 @@ def check_usta(usta_url: Optional[str], debug: bool) -> None:
         sys.exit(1)
 
     click.echo("\nUSTA TennisLink check complete.")
+
+
+@cli.command("record-result")
+@click.option("--id", "record_id", default=None, help="Match record ID printed after analyze (e.g. a3f2b1c0)")
+def record_result(record_id: Optional[str]) -> None:
+    """Enter the actual court results after a match to improve future predictions."""
+    from tennisai.tools.history import load_history
+
+    records = load_history()
+    if not records:
+        click.echo("No match history found. Run 'analyze' first.")
+        return
+
+    # Pick the record to update
+    if not record_id:
+        click.echo("\nRecent predictions (newest first):")
+        for r in reversed(records[-8:]):
+            date_str = str(r.match_date) if r.match_date else r.recorded_at[:10]
+            status = "✓ results recorded" if r.actual_results else "pending"
+            click.echo(f"  {r.id}  {date_str}  vs {r.opponent}  [{status}]")
+        record_id = click.prompt("\nEnter record ID to update").strip()
+
+    record = next((r for r in records if r.id == record_id), None)
+    if not record:
+        click.echo(f"No record found with ID '{record_id}'.", err=True)
+        return
+
+    click.echo(f"\nEntering results for: {record.match_date} vs {record.opponent}")
+    click.echo("For each court enter 'us' or 'them' (or press Enter to skip).\n")
+
+    actual_results: list[CourtResult] = []
+    for pred in record.predictions:
+        our = ", ".join(pred.my_players) or "TBD"
+        them = ", ".join(pred.opponent_players) or "TBD"
+        click.echo(f"  Court {pred.court} {pred.court_type}: {our} vs {them} (predicted: {pred.predicted_winner})")
+        while True:
+            raw = click.prompt("  Winner", default="", show_default=False).strip().lower()
+            if raw == "":
+                break
+            if raw in ("us", "them"):
+                score = click.prompt("  Score (optional, e.g. 6-3 6-4)", default="", show_default=False).strip()
+                actual_results.append(CourtResult(
+                    court=pred.court,
+                    court_type=pred.court_type,
+                    winner=raw,
+                    score=score,
+                ))
+                break
+            click.echo("  Please enter 'us' or 'them'.")
+
+    if not actual_results:
+        click.echo("No results entered.")
+        return
+
+    updated = update_result(record_id, actual_results)
+    if updated:
+        correct = sum(
+            1 for a in updated.actual_results
+            for p in updated.predictions
+            if p.court == a.court and p.court_type == a.court_type
+            and p.predicted_winner.lower() == a.winner.lower()
+        )
+        total = len(updated.actual_results)
+        click.echo(f"\nResults saved. Prediction accuracy: {correct}/{total} courts correct.")
+        click.echo(f"Overall match result: {updated.overall_actual}.")
 
 
 def main() -> None:
