@@ -256,11 +256,22 @@ def _build_user_message(
         "and assigning them to courts accordingly\n"
     )
 
-    court_format = f"MATCH FORMAT: {singles_courts} Singles courts + {doubles_courts} Doubles courts = {singles_courts + doubles_courts} courts total. Do NOT predict any other courts."
+    singles_labels = " | ".join(f"Singles court={i}" for i in range(1, singles_courts + 1))
+    doubles_labels = " | ".join(f"Doubles court={i}" for i in range(1, doubles_courts + 1))
+    court_format = (
+        f"MATCH FORMAT: {singles_courts} Singles courts + {doubles_courts} Doubles courts = "
+        f"{singles_courts + doubles_courts} courts total. Courts: [{singles_labels} | {doubles_labels}]. "
+        "Do NOT invent other courts. Doubles courts are numbered 1, 2, 3 — NOT 3, 4, 5."
+    )
+    winner_note = (
+        "CRITICAL — predicted_winner field: write 'us' when THE CAPTAIN'S TEAM wins that court, "
+        "write 'them' when THE OPPONENT wins. Never write 'them' for a court our team is predicted to win."
+    )
 
     return (
         f"Analyze our next match. tennisrecord URL: {my_team_url} | USTA URL: {usta_team_url}\n\n"
         f"{court_format}\n\n"
+        f"{winner_note}\n\n"
         f"Our lineup:\n{lineup_text}\n\n"
         f"{opponent_section}"
         f"{history_section}"
@@ -442,11 +453,63 @@ def _parse_final_response(text: str, my_team_url: str, usta_team_url: str) -> Ma
             players=[Player(**p) for p in t.get("players", [])],
         )
 
+    predictions = [CourtPrediction(**p) for p in data.get("predictions", [])]
+    predictions = [_fix_predicted_winner(p) for p in predictions]
+
     return MatchAnalysis(
         match=match,
         my_team=_build_team(data.get("my_team", {}), my_team_url),
         opponent_team=_build_team(data.get("opponent_team", {}), ""),
-        predictions=[CourtPrediction(**p) for p in data.get("predictions", [])],
+        predictions=predictions,
         overall_outlook=data.get("overall_outlook", ""),
         lineup_suggestions=data.get("lineup_suggestions", []),
     )
+
+
+def _fix_predicted_winner(pred: CourtPrediction) -> CourtPrediction:
+    """
+    Safety net: cross-check predicted_winner against the reasoning text.
+    The LLM sometimes outputs 'them' for courts our team wins.
+    Signals in reasoning that mean WE win: 'my team', 'our team', 'predicting a win for my team',
+    'predicting a win for our team', 'i predict us', 'we will win'.
+    Signals that mean THEY win: 'predicting a win for the opponent', 'opponent wins'.
+    """
+    r = pred.reasoning.lower()
+    we_win_signals = [
+        "predicting a win for my team",
+        "predicting a win for our team",
+        "i predict us",
+        "we will win",
+        "our team will win",
+        "my team will win",
+    ]
+    they_win_signals = [
+        "predicting a win for the opponent",
+        "predicting a win for them",
+        "opponent will win",
+        "opponent wins",
+    ]
+
+    inferred_winner = None
+    for s in we_win_signals:
+        if s in r:
+            inferred_winner = "us"
+            break
+    if inferred_winner is None:
+        for s in they_win_signals:
+            if s in r:
+                inferred_winner = "them"
+                break
+
+    if inferred_winner and inferred_winner != pred.predicted_winner.lower():
+        return CourtPrediction(
+            court=pred.court,
+            court_type=pred.court_type,
+            my_players=pred.my_players,
+            opponent_players=pred.opponent_players,
+            predicted_winner=inferred_winner,
+            predicted_score=pred.predicted_score,
+            confidence=pred.confidence,
+            reasoning=pred.reasoning,
+        )
+    return pred
