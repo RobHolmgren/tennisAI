@@ -163,6 +163,11 @@ class USTAClient:
 
         upcoming, _ = _parse_from_html(schedule_html)
         _, results = _parse_from_html(summary_html)
+
+        # Fallback: if summary tab returned nothing, extract completed rows from schedule tab
+        if not results:
+            _, results = _parse_completed_from_schedule(schedule_html)
+
         return upcoming, results
 
     def get_schedule(self, usta_url: str) -> list[Match]:
@@ -263,6 +268,133 @@ class USTAClient:
             ))
         return trends
 
+    def get_standings(self, usta_url: str) -> dict:
+        """
+        Fetch current league standings from the USTA Standings tab.
+        Returns list of teams with their position, wins, losses, and total matches.
+        Also returns our team's position and matches remaining in the season.
+        """
+        self._ensure_page(usta_url)
+        _click_single_tab(self._page, "ctl00_mainContent_lnkStandingsForTeams")
+        html = self._page.content()
+        return _parse_standings(html)
+
+    def get_roster_with_profiles(self, usta_url: str) -> dict[str, dict]:
+        """
+        Scrape our team's roster tab.
+        Returns dict keyed by player name:
+          {"profile_url": str, "wtn_singles": float|None, "wtn_doubles": float|None, "ntrp": float|None}
+        WTN is read directly from the roster table when available, saving individual profile fetches.
+        Profile URL is stored so fetch_wtn() can be called later if WTN is not in the table.
+        """
+        self._ensure_page(usta_url)
+        _click_single_tab(self._page, "ctl00_mainContent_lnkRosterForTeams")
+        html = self._page.content()
+        return _parse_roster_html(html)
+
+    def get_opponent_profiles_from_scorecards(self, usta_url: str) -> dict[str, dict]:
+        """
+        Visit recent match scorecards and extract opponent player profile links.
+        Returns same structure as get_roster_with_profiles.
+        Uses at most 5 recent scorecards to cap Playwright time.
+        """
+        self._ensure_page(usta_url)
+
+        # Collect scorecard URLs from both tabs
+        _click_single_tab(self._page, "ctl00_mainContent_lnkMatchSummaryForTeams")
+        scorecard_urls = _extract_scorecard_urls(self._page.content())
+        if not scorecard_urls:
+            _click_single_tab(self._page, "ctl00_mainContent_lnkMatchScheduleForTeams")
+            scorecard_urls = _extract_scorecard_urls(self._page.content())
+
+        players: dict[str, dict] = {}
+        our_team = get_my_team_name().lower()
+
+        for url in scorecard_urls[:5]:
+            full_url = url if url.startswith("http") else f"https://tennislink.usta.com{url}"
+            try:
+                self._page.goto(full_url, wait_until="domcontentloaded")
+                try:
+                    self._page.wait_for_load_state("networkidle", timeout=8_000)
+                except Exception:
+                    pass
+                found = _parse_scorecard_player_profiles(self._page.content(), our_team)
+                for name, info in found.items():
+                    if name not in players:
+                        players[name] = info
+            except Exception:
+                continue
+
+        # Navigate back
+        try:
+            self._page.goto(usta_url, wait_until="domcontentloaded")
+            self._page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT_MS)
+        except Exception:
+            pass
+
+        return players
+
+    def get_full_schedule(self, usta_url: str) -> tuple[list[Match], list[MatchResult]]:
+        """Return both upcoming and completed matches (same as get_schedule_and_results)."""
+        return self.get_schedule_and_results(usta_url)
+
+    def get_scorecard_urls(self, usta_url: str) -> list[tuple[datetime.date, str, str]]:
+        """
+        Return list of (date, opponent, full_url) for all past matches with View Score links.
+        Always checks both the Match Summary and Match Schedule tabs and merges results,
+        because recent completed matches may appear on the Schedule tab before appearing
+        on the Summary tab.
+        """
+        self._ensure_page(usta_url)
+
+        _click_single_tab(self._page, "ctl00_mainContent_lnkMatchSummaryForTeams")
+        summary_entries = _extract_scorecard_urls_with_meta(self._page.content())
+
+        _click_single_tab(self._page, "ctl00_mainContent_lnkMatchScheduleForTeams")
+        sched_entries = _extract_scorecard_urls_with_meta(self._page.content())
+
+        # Deduplicate by (date, opponent prefix) — same match can appear on both tabs
+        seen_key: set[tuple] = set()
+        merged: list[tuple[datetime.date, str, str]] = []
+        for entry in summary_entries + sched_entries:
+            key = (entry[0], entry[1].lower()[:12])
+            if key not in seen_key:
+                seen_key.add(key)
+                merged.append(entry)
+
+        merged.sort(key=lambda e: e[0], reverse=True)
+        return merged
+
+    def get_match_scorecard(self, usta_url: str, scorecard_url: str) -> dict:
+        """
+        Scrape a single USTA match scorecard.
+        Returns dict with keys:
+          date, home_team, away_team,
+          our_lineup (dict[court_label, list[str]]),
+          opponent_lineup (dict[court_label, list[str]]),
+          actual_results (list[CourtResult])
+        Returns empty dict on failure.
+        """
+        self._ensure_page(usta_url)
+        full_url = scorecard_url if scorecard_url.startswith("http") else f"https://tennislink.usta.com{scorecard_url}"
+        try:
+            self._page.goto(full_url, wait_until="domcontentloaded")
+            try:
+                self._page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+            html = self._page.content()
+            return _parse_scorecard_full(html)
+        except Exception:
+            return {}
+        finally:
+            # Navigate back so the session stays on the team page
+            try:
+                self._page.goto(usta_url, wait_until="domcontentloaded")
+                self._page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT_MS)
+            except Exception:
+                pass
+
     def debug_page(self, usta_url: str) -> None:
         """
         Extended debug: click every visible tab/link on the stats page to trigger
@@ -360,6 +492,42 @@ def _parse_results_from_captured(captured: list[dict]) -> list[MatchResult]:
 
     results.sort(key=lambda r: r.date or datetime.date.min, reverse=True)
     return results[:5]  # most recent 5
+
+
+def _parse_completed_from_schedule(html: str) -> tuple[list[Match], list[MatchResult]]:
+    """
+    Extract completed matches directly from the schedule tab HTML.
+    Rows with 'View Score' (and not 'Enter Score') are completed matches.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[MatchResult] = []
+    our_team = get_my_team_name()
+
+    sched_panel = soup.find("div", id="ctl00_mainContent_pnlMatchSchedule")
+    if not sched_panel:
+        # Try any table in the page as fallback
+        sched_panel = soup
+
+    for row in sched_panel.find_all("tr"):
+        cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+        if len(cells) < 16:
+            continue
+        action = cells[8]
+        if "View Score" not in action or "Enter Score" in action:
+            continue
+        d = _parse_date_flexible(cells[9])
+        if not d:
+            continue
+        home = _clean_team(cells[11])
+        away = _clean_team(cells[13])
+        facility = _clean_team(cells[15]) if len(cells) > 15 else ""
+        is_home = our_team.lower() in home.lower() if our_team else True
+        opponent = away if is_home else home
+        results.append(MatchResult(date=d, opponent=opponent, location=facility))
+
+    return [], results
 
 
 def _parse_from_html(html: str) -> tuple[list[Match], list[MatchResult]]:
@@ -538,6 +706,215 @@ def _extract_scorecard_urls(html: str) -> list[str]:
     return urls
 
 
+def _extract_scorecard_urls_with_meta(html: str) -> list[tuple[datetime.date, str, str]]:
+    """
+    Extract (date, opponent, full_url) from USTA schedule/summary HTML.
+
+    Mirrors _parse_completed_from_schedule exactly (cells[8] action check,
+    16-cell requirement, fixed indices for date/teams) then additionally
+    extracts the href for the scorecard link from the row.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    our_team = get_my_team_name()
+    entries: list[tuple[datetime.date, str, str]] = []
+    seen: set[str] = set()
+
+    # Search within the schedule panel if present, otherwise whole page
+    panel = (soup.find("div", id="ctl00_mainContent_pnlMatchSchedule")
+             or soup.find("div", id=lambda x: x and "matchsummary" in x.lower() and "pnl" in x.lower())
+             or soup)
+
+    for row in panel.find_all("tr"):
+        cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+        if len(cells) < 16:
+            continue
+
+        action = cells[8]
+        if "View Score" not in action or "Enter Score" in action:
+            continue
+
+        d = _parse_date_flexible(cells[9])
+        if not d:
+            continue
+
+        home = _clean_team(cells[11])
+        away = _clean_team(cells[13])
+        is_home = our_team.lower() in home.lower() if our_team else True
+        opponent = away if is_home else home
+        if not opponent:
+            opponent = "Unknown"
+
+        # Find the scorecard href — any link in the row works
+        href = None
+        for a in row.find_all("a", href=True):
+            h = a["href"]
+            # Prefer links that look like scorecards; fall back to any link
+            if "score" in h.lower() or "matchid" in h.lower():
+                href = h
+                break
+        if not href:
+            for a in row.find_all("a", href=True):
+                href = a["href"]
+                break
+        if not href:
+            continue
+
+        full_url = href if href.startswith("http") else f"https://tennislink.usta.com{href}"
+        if full_url not in seen:
+            seen.add(full_url)
+            entries.append((d, opponent, full_url))
+
+    entries.sort(key=lambda e: e[0], reverse=True)
+    return entries
+
+
+def _parse_scorecard_full(html: str) -> dict:
+    """
+    Parse a USTA match scorecard page into structured data.
+    Returns:
+      {date, home_team, away_team,
+       our_lineup: dict[str, list[str]],
+       opponent_lineup: dict[str, list[str]],
+       actual_results: list[CourtResult]}
+    """
+    from bs4 import BeautifulSoup
+    from tennisai.models import CourtResult
+
+    soup = BeautifulSoup(html, "html.parser")
+    our_team = get_my_team_name().lower()
+
+    # --- Parse match header (date, teams) ---
+    date_val: datetime.date | None = None
+    home_team = ""
+    away_team = ""
+    text = soup.get_text(" ")
+    for line in text.splitlines():
+        line = line.strip()
+        if not date_val:
+            date_val = _parse_date_flexible(line)
+        if not home_team and len(line) > 5 and "vs" in line.lower():
+            parts = re.split(r"\s+vs\.?\s+", line, flags=re.IGNORECASE)
+            if len(parts) == 2:
+                home_team = parts[0].strip()
+                away_team = parts[1].strip()
+            break
+
+    is_home = our_team[:6] in home_team.lower() if home_team else True
+
+    # --- Parse per-court rows ---
+    our_lineup: dict[str, list[str]] = {}
+    opp_lineup: dict[str, list[str]] = {}
+    actual_results: list[CourtResult] = []
+
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+
+        # Check if this looks like a court table (has S1/D1 style entries)
+        has_courts = False
+        for row in rows:
+            cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+            if cells and (re.search(r"[sd](?:ingles|oubles)?\s*\d", cells[0], re.I)
+                          or re.search(r"\b[sd]\d\b", cells[0], re.I)):
+                has_courts = True
+                break
+        if not has_courts:
+            continue
+
+        for row in rows:
+            cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+            if len(cells) < 3:
+                continue
+
+            court_cell = cells[0].strip().lower()
+            singles_m = re.search(r"s(?:ingles)?\s*(\d)", court_cell)
+            doubles_m = re.search(r"d(?:oubles)?\s*(\d)", court_cell)
+            if singles_m:
+                court_num = int(singles_m.group(1))
+                court_type = "Singles"
+                player_count = 1
+            elif doubles_m:
+                court_num = int(doubles_m.group(1))
+                court_type = "Doubles"
+                player_count = 2
+            else:
+                continue
+
+            court_label = f"Court {court_num} {court_type}"
+
+            # Extract player names from middle cells (between court label and score/result)
+            # Typical layouts:
+            # [court, home_player, away_player, score, W/L, W/L]  (singles)
+            # [court, home_p1, home_p2, away_p1, away_p2, score, W/L, W/L]  (doubles)
+            # [court, home_combined, away_combined, score, W/L, W/L]  (doubles combined)
+            player_cells = [c for c in cells[1:] if c and not re.match(r"^[\d\-\s]+$", c)
+                            and c.upper() not in ("W", "L", "WO", "DEF") and len(c) > 2]
+
+            # Detect W/L from last 2 cells
+            home_won: bool | None = None
+            for c in reversed(cells):
+                cu = c.strip().upper()
+                if cu == "W":
+                    home_won = True
+                    break
+                if cu == "L":
+                    home_won = False
+                    break
+
+            # Assign player cells to home/away
+            home_players: list[str] = []
+            away_players: list[str] = []
+            if len(player_cells) >= 2:
+                if player_count == 1:
+                    home_players = [_clean_name(player_cells[0])]
+                    away_players = [_clean_name(player_cells[1])]
+                else:
+                    mid = len(player_cells) // 2
+                    home_players = [_clean_name(p) for p in player_cells[:mid]]
+                    away_players = [_clean_name(p) for p in player_cells[mid:mid + player_count]]
+
+            if is_home:
+                our_players = home_players
+                their_players = away_players
+                we_won = home_won
+            else:
+                our_players = away_players
+                their_players = home_players
+                we_won = (not home_won) if home_won is not None else None
+
+            if our_players:
+                our_lineup[court_label] = our_players
+            if their_players:
+                opp_lineup[court_label] = their_players
+            if we_won is not None:
+                actual_results.append(CourtResult(
+                    court=court_num,
+                    court_type=court_type,
+                    winner="us" if we_won else "them",
+                    score="",
+                ))
+
+        if our_lineup:  # found a valid court table
+            break
+
+    return {
+        "date": date_val,
+        "home_team": home_team,
+        "away_team": away_team,
+        "our_lineup": our_lineup,
+        "opponent_lineup": opp_lineup,
+        "actual_results": actual_results,
+    }
+
+
+def _clean_name(raw: str) -> str:
+    """Clean a player name extracted from scorecard HTML."""
+    return re.sub(r"\s+", " ", raw).strip()
+
+
 def _parse_scorecard(html: str) -> list[tuple[tuple[int, str], bool]]:
     """
     Parse a USTA match scorecard page.
@@ -591,6 +968,174 @@ def _parse_scorecard(html: str) -> list[tuple[tuple[int, str], bool]]:
             results.append(((court_num, court_type), won))
 
     return results
+
+
+def _parse_roster_html(html: str) -> dict[str, dict]:
+    """
+    Parse the USTA TennisLink team roster tab.
+    Extracts player name, profile URL, WTN singles/doubles, and NTRP from the roster table.
+    WTN may be shown directly in the table — if so, no separate profile fetch is needed.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    players: dict[str, dict] = {}
+
+    for table in soup.find_all("table"):
+        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+        # Roster tables have a "name" or "player" column
+        if not any("name" in h or "player" in h for h in headers):
+            continue
+
+        name_idx = next((i for i, h in enumerate(headers) if "name" in h or "player" in h), None)
+        ntrp_idx = next((i for i, h in enumerate(headers) if "ntrp" in h or "rating" in h), None)
+        # WTN columns may be labelled "wtn", "singles wtn", "doubles wtn", "wtn singles", etc.
+        wtn_s_idx = next((i for i, h in enumerate(headers)
+                          if ("wtn" in h and "single" in h) or h == "wtn singles" or h == "singles wtn"), None)
+        wtn_d_idx = next((i for i, h in enumerate(headers)
+                          if ("wtn" in h and "double" in h) or h == "wtn doubles" or h == "doubles wtn"), None)
+        # Generic "wtn" column — treat as singles if no split columns found
+        if wtn_s_idx is None and wtn_d_idx is None:
+            wtn_s_idx = next((i for i, h in enumerate(headers) if h == "wtn"), None)
+
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
+            if not cells or name_idx is None or name_idx >= len(cells):
+                continue
+
+            name_cell = cells[name_idx]
+            name = name_cell.get_text(strip=True)
+            if not name or len(name) < 3:
+                continue
+
+            # Extract profile link from name cell
+            profile_url = ""
+            a = name_cell.find("a", href=True)
+            if a:
+                href = a["href"]
+                profile_url = href if href.startswith("http") else f"https://tennislink.usta.com{href}"
+
+            def _cell_float(idx):
+                if idx is None or idx >= len(cells):
+                    return None
+                try:
+                    v = float(cells[idx].get_text(strip=True))
+                    return v if v > 0 else None
+                except (ValueError, TypeError):
+                    return None
+
+            players[name] = {
+                "profile_url": profile_url,
+                "ntrp": _cell_float(ntrp_idx),
+                "wtn_singles": _cell_float(wtn_s_idx),
+                "wtn_doubles": _cell_float(wtn_d_idx),
+            }
+
+        if players:
+            break
+
+    return players
+
+
+def _parse_scorecard_player_profiles(html: str, our_team_fragment: str) -> dict[str, dict]:
+    """
+    Extract OPPONENT player names and profile links from a match scorecard page.
+    Identifies which side is the opponent by checking team name.
+    Returns {player_name: {"profile_url": str, "wtn_singles": None, "wtn_doubles": None}}.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    players: dict[str, dict] = {}
+
+    # Determine which side is ours by scanning headers/labels for team name
+    text = soup.get_text(" ").lower()
+    # Find "vs" split to identify home/away
+    is_home = our_team_fragment[:6] in text[:text.find(" vs ")] if " vs " in text else True
+
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) < 3:
+                continue
+            court_text = cells[0].get_text(strip=True).lower()
+            if not (re.search(r"[sd](?:ingles|oubles)?\s*\d", court_text)
+                    or re.search(r"\b[sd]\d\b", court_text)):
+                continue
+
+            # Collect all player-name cells with links (cells 1 onward, skip score/result cells)
+            linked_players: list[tuple[str, str]] = []
+            for cell in cells[1:]:
+                for a in cell.find_all("a", href=True):
+                    name = a.get_text(strip=True)
+                    href = a["href"]
+                    if name and len(name) > 3 and not _parse_date_flexible(name):
+                        full = href if href.startswith("http") else f"https://tennislink.usta.com{href}"
+                        linked_players.append((name, full))
+
+            # The opponent side depends on is_home: away players are second half
+            mid = len(linked_players) // 2
+            opp_players = linked_players[mid:] if is_home else linked_players[:mid]
+            for name, url in opp_players:
+                if name not in players:
+                    players[name] = {"profile_url": url, "wtn_singles": None, "wtn_doubles": None}
+
+    return players
+
+
+def _parse_standings(html: str) -> dict:
+    """
+    Parse the USTA Standings tab HTML.
+    Returns our position, total teams, wins/losses, and matches remaining.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    our_team = get_my_team_name().lower()
+    standings: list[dict] = []
+
+    for table in soup.find_all("table"):
+        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+        has_win = any("win" in h for h in headers)
+        has_team = any("team" in h for h in headers)
+        if not (has_win and has_team):
+            continue
+
+        team_idx = next((i for i, h in enumerate(headers) if "team" in h), None)
+        win_idx  = next((i for i, h in enumerate(headers) if h == "win" or h == "wins" or h == "w"), None)
+        loss_idx = next((i for i, h in enumerate(headers) if h in ("loss", "losses", "l")), None)
+
+        for row in table.find_all("tr"):
+            cells = [td.get_text(strip=True) for td in row.find_all("td")]
+            if not cells or team_idx is None or team_idx >= len(cells):
+                continue
+            try:
+                wins   = int(cells[win_idx])  if win_idx  is not None and win_idx  < len(cells) else 0
+                losses = int(cells[loss_idx]) if loss_idx is not None and loss_idx < len(cells) else 0
+            except ValueError:
+                continue
+            standings.append({
+                "team":   cells[team_idx],
+                "wins":   wins,
+                "losses": losses,
+                "matches": wins + losses,
+            })
+
+        if standings:
+            break
+
+    our_entry = next((s for s in standings if our_team in s["team"].lower()), None)
+    position  = next((i + 1 for i, s in enumerate(standings) if our_team in s["team"].lower()), None)
+
+    return {
+        "standings": standings,
+        "our_position": position,
+        "total_teams": len(standings),
+        "our_wins":   our_entry["wins"]   if our_entry else None,
+        "our_losses": our_entry["losses"] if our_entry else None,
+        "our_matches_played": our_entry["matches"] if our_entry else None,
+    }
 
 
 def _clean_team(raw: str) -> str:

@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from tennisai.config import get_ai_provider, get_groq_api_key, get_anthropic_api_key, get_scoring_format
 from tennisai.models import CourtPrediction, Match, MatchAnalysis, Player, Team
+from tennisai.tools.history import get_player_stats, get_season_context
 from tennisai.tools.tennisrecord import get_league_teams, get_player_history, get_team_ratings
 from tennisai.tools.usta import USTAClient
 
@@ -201,8 +202,12 @@ def _build_system_prompt() -> str:
         "You are a USTA adult league tennis analyst. Use tools to gather data, then predict court outcomes.\n\n"
         f"Scoring format: {scoring}. "
         "Predict scores like '6-3 6-2' or '4-6 6-3 [10-7]'. First number in each set = our score.\n\n"
-        "Ratings: use 'rating' (2-decimal, e.g. 2.98) as primary predictor; fall back to ntrp_level only if missing. "
-        "3.12 beats 2.94 even if both are NTRP 3.0.\n\n"
+        "Rating scales when provided:\n"
+        "  WTN-S = WTN singles (LOWER is stronger: 1=elite, 40=beginner). Use for singles courts.\n"
+        "  WTN-D = WTN doubles (same scale). Use for doubles courts.\n"
+        "  TR = tennisrecord combined rating (HIGHER is stronger, e.g. 3.12 beats 2.94).\n"
+        "Use WTN-S/WTN-D as primary signals when available; TR as supporting context. "
+        "Use all available signals together — never ignore a rating just because another is present.\n\n"
         "Weigh these factors: (1) ratings, (2) per-court win/loss trends, (3) player form last 6 months, "
         "(4) predicted opponent lineup strongest-to-weakest by court, (5) lineup changes to maximise team wins. "
         "Goal is team match victory (most courts), not individual courts. "
@@ -416,6 +421,112 @@ def run_analysis(
     )
 
 
+def _player_rating_line(name: str) -> str:
+    """Build a compact rating line for a player using all available sources."""
+    try:
+        from tennisai.modules.players.store import load_player
+        pf = load_player(name)
+        if not pf:
+            return f"  {name}: no rating data"
+        parts: list[str] = []
+        if pf.wtn_singles is not None:
+            parts.append(f"WTN-S={pf.wtn_singles}")
+        if pf.wtn_doubles is not None:
+            parts.append(f"WTN-D={pf.wtn_doubles}")
+        if pf.tennisrecord_rating:
+            parts.append(f"TR={pf.tennisrecord_rating}")
+        elif pf.ntrp_level:
+            parts.append(f"NTRP={pf.ntrp_level}")
+        sr = f"{pf.singles_wins}W-{pf.singles_losses}L"
+        dr = f"{pf.doubles_wins}W-{pf.doubles_losses}L"
+        rating_str = "  ".join(parts) if parts else "no rating"
+        return f"  {name}: {rating_str} | S={sr} D={dr}"
+    except Exception:
+        return f"  {name}"
+
+
+def run_analysis_direct(
+    lineup: dict[str, list[str]],
+    opponent_lineup: dict[str, list[str]],
+    history_text: str = "",
+    singles_courts: int = 2,
+    doubles_courts: int = 3,
+    match_date: Optional[datetime.date] = None,
+    opponent_name: str = "",
+) -> MatchAnalysis:
+    """
+    Predict court outcomes without any tool calls — all data is provided inline.
+    Used for backfill and any case where both lineups are already known.
+    Avoids the Groq 400 error caused by malformed get_player_history XML tool calls.
+    """
+    # Build per-player rating lines for both teams
+    all_our_players = [p for players in lineup.values() for p in players]
+    all_opp_players = [p for players in opponent_lineup.values() for p in players]
+    our_rating_lines = "\n".join(_player_rating_line(p) for p in all_our_players)
+    opp_rating_lines = "\n".join(_player_rating_line(p) for p in all_opp_players)
+
+    lineup_text = "\n".join(f"  {court}: {', '.join(players)}" for court, players in lineup.items())
+    opp_text = "\n".join(f"  {court}: {', '.join(players)}" for court, players in opponent_lineup.items())
+
+    singles_labels = " | ".join(f"Singles court={i}" for i in range(1, singles_courts + 1))
+    doubles_labels = " | ".join(f"Doubles court={i}" for i in range(1, doubles_courts + 1))
+    court_format = (
+        f"MATCH FORMAT: {singles_courts} Singles + {doubles_courts} Doubles = "
+        f"{singles_courts + doubles_courts} courts total. [{singles_labels} | {doubles_labels}]. "
+        "Doubles courts are numbered 1, 2, 3 — NOT 3, 4, 5."
+    )
+    winner_note = (
+        "CRITICAL — predicted_winner: write 'us' when THE CAPTAIN'S TEAM wins, "
+        "'them' when THE OPPONENT wins."
+    )
+    date_str = str(match_date) if match_date else "unknown"
+    opp_str = opponent_name or "Opponent"
+    history_section = f"\n{history_text}\n" if history_text else ""
+
+    prompt = (
+        f"Predict court-by-court outcomes for our USTA match on {date_str} vs {opp_str}.\n\n"
+        f"{court_format}\n\n{winner_note}\n\n"
+        f"Our lineup:\n{lineup_text}\n\n"
+        f"Our player ratings:\n{our_rating_lines}\n\n"
+        f"Opponent lineup:\n{opp_text}\n\n"
+        f"Opponent player ratings:\n{opp_rating_lines}\n"
+        f"{history_section}\n"
+        "Using all ratings (WTN-S for singles courts, WTN-D for doubles courts, TR as supporting context) "
+        "and calibration history above, predict who wins each court with a score. "
+        "Then give an overall outlook and any lineup suggestions.\n\n"
+        + _OUTPUT_SCHEMA
+    )
+
+    provider = get_ai_provider()
+
+    if provider == "groq":
+        from groq import Groq
+        client = Groq(api_key=get_groq_api_key())
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=4096,
+        )
+        return _parse_final_response(response.choices[0].message.content or "", "", "")
+
+    if provider == "claude":
+        import anthropic
+        client = anthropic.Anthropic(api_key=get_anthropic_api_key())
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
+            system=_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        final_text = next((b.text for b in response.content if hasattr(b, "text")), "")
+        return _parse_final_response(final_text, "", "")
+
+    raise NotImplementedError(f"AI provider '{provider}' is not implemented.")
+
+
 # ---------------------------------------------------------------------------
 # Response parser (shared)
 # ---------------------------------------------------------------------------
@@ -439,8 +550,17 @@ def _parse_final_response(text: str, my_team_url: str, usta_team_url: str) -> Ma
         )
 
     match_data = data.get("match", {})
+    raw_date = match_data.get("date")
+    # Reject LLM-hallucinated past dates — only accept future/today dates
+    if raw_date:
+        try:
+            parsed_date = datetime.date.fromisoformat(str(raw_date))
+            if parsed_date < datetime.date.today():
+                raw_date = None
+        except (ValueError, TypeError):
+            raw_date = None
     match = Match(
-        date=match_data.get("date"),
+        date=raw_date,
         home_team=match_data.get("home_team", ""),
         away_team=match_data.get("away_team", ""),
         location=match_data.get("location", ""),
@@ -513,3 +633,113 @@ def _fix_predicted_winner(pred: CourtPrediction) -> CourtPrediction:
             reasoning=pred.reasoning,
         )
     return pred
+
+
+# ---------------------------------------------------------------------------
+# Lineup suggestion (delegates to modules/lineup/predictor)
+# ---------------------------------------------------------------------------
+
+def run_lineup_suggestion(
+    my_team_url: str,
+    usta_team_url: str,
+    available_players: list[str],
+    singles_courts: int = 2,
+    doubles_courts: int = 3,
+) -> dict:
+    """
+    Recommend an optimal lineup from available players and predict the opponent lineup.
+    Returns a structured dict with our_lineup, opponent_lineup, reasoning, rotation_notes, etc.
+    """
+    from tennisai.modules.lineup.predictor import predict_lineup
+    from tennisai.modules.players.store import rebuild_from_matches
+
+    # Ensure player files are up to date before making recommendations
+    rebuild_from_matches()
+
+    season = get_season_context()
+
+    # Fetch opponent via USTA
+    client = USTAClient()
+    upcoming, _ = client.get_schedule_and_results(usta_team_url)
+    standings = client.get_standings(usta_team_url)
+    client.close()
+
+    today = datetime.date.today()
+    next_match = next((m for m in upcoming if m.date and m.date >= today), None)
+    opponent_name = ""
+    our_team_obj = get_team_ratings(my_team_url)
+    our_full_roster: set[str] = {p.name for p in our_team_obj.players}
+    if next_match:
+        our_name = our_team_obj.name.lower()
+        opponent_name = (
+            next_match.away_team
+            if our_name[:8] in (next_match.home_team or "").lower()
+            else next_match.home_team
+        ) or ""
+
+    # season and standings are passed through to predict_lineup
+
+    # Fetch opponent ratings directly so LLM can predict their lineup too
+    opponent_players_text = ""
+    opponent_team_url = ""
+    opp_full = None
+    if opponent_name:
+        try:
+            league_teams = get_league_teams(my_team_url)
+            opp_lower = opponent_name.lower()
+            opp_team = next(
+                (t for t in league_teams if opp_lower[:8] in t.name.lower() or t.name.lower()[:8] in opp_lower),
+                None,
+            )
+            if opp_team:
+                opponent_team_url = opp_team.url
+                opp_full = get_team_ratings(opp_team.url)
+                opp_lines = [
+                    f"  {p.name} (NTRP {p.rating})" for p in opp_full.players
+                ]
+                opponent_players_text = (
+                    f"\nOpponent team: {opp_full.name}\n"
+                    "Opponent players:\n" + "\n".join(opp_lines)
+                )
+        except Exception:
+            pass
+
+    has_real_opponents = bool(opponent_players_text)
+
+    # --- Our lineup: use the lineup module (optimizer + LLM reasoning) ---
+    our_result = predict_lineup(
+        available_players=available_players,
+        singles_courts=singles_courts,
+        doubles_courts=doubles_courts,
+        season_context=season,
+        standings=standings,
+        opponent_name=opponent_name,
+        team_label="our team",
+    )
+
+    # --- Opponent lineup: same function applied to their roster ---
+    opponent_lineup: dict[str, list[str]] = {}
+    if has_real_opponents and opp_full:
+        opp_names = [p.name for p in opp_full.players]
+        opp_result = predict_lineup(
+            available_players=opp_names,
+            singles_courts=singles_courts,
+            doubles_courts=doubles_courts,
+            opponent_name="our team",
+            team_label=f"opponent ({opp_full.name})",
+        )
+        # Filter out any of our players that may have slipped in
+        for label, players in opp_result["lineup"].items():
+            clean = [p for p in players if p not in our_full_roster]
+            if clean:
+                opponent_lineup[label] = clean
+
+    return {
+        "our_lineup": our_result["lineup"],
+        "opponent_lineup": opponent_lineup,
+        "per_court_reasoning": our_result["per_court_reasoning"],
+        "rotation_notes": our_result["rotation_notes"],
+        "season_outlook": our_result["season_outlook"],
+        "has_real_opponents": has_real_opponents,
+        "opponent_name": opponent_name,
+    }

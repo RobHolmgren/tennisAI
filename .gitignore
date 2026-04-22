@@ -1,6 +1,9 @@
 .env
 requirements.md
+new_requirements.md
 .match_history.json
+matches/
+players/
 __pycache__/
 *.py[cod]
 *.egg-info/

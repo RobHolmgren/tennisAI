@@ -1,35 +1,52 @@
 """
-Local match history store — saves predictions and actual results to .match_history.json.
-This file is gitignored and stays on the local machine only.
-It feeds past prediction/result pairs back to the agent as calibration context.
+Backward-compatible shim — delegates to the new modules/matches and modules/players stores.
+All existing callers continue to work unchanged.
 """
-
-import datetime
-import json
-import uuid
-from pathlib import Path
 from typing import Optional
 
-from tennisai.models import CourtResult, MatchAnalysis, MatchRecord
+from tennisai.models import CourtResult, MatchAnalysis, MatchRecord, CourtPrediction
+from tennisai.modules.matches.store import (
+    load_all_matches,
+    save_from_analysis,
+    record_actual_results,
+    get_recent_completed,
+    migrate_from_history as _migrate,
+)
+from tennisai.modules.matches.models import MatchFile
 
-HISTORY_FILE = Path(__file__).parent.parent.parent / ".match_history.json"
 
+# ---------------------------------------------------------------------------
+# MatchRecord ↔ MatchFile bridge helpers
+# ---------------------------------------------------------------------------
+
+def _file_to_record(mf: MatchFile) -> MatchRecord:
+    return MatchRecord(
+        id=mf.id,
+        recorded_at=mf.recorded_at,
+        match_date=mf.match_date,
+        opponent=mf.opponent,
+        our_lineup=mf.our_lineup,
+        opponent_lineup=mf.opponent_lineup,
+        predictions=mf.predictions,
+        actual_results=mf.actual_results,
+        overall_predicted=mf.overall_predicted,
+        overall_actual=mf.overall_actual,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API (unchanged signatures)
+# ---------------------------------------------------------------------------
 
 def load_history() -> list[MatchRecord]:
-    if not HISTORY_FILE.exists():
-        return []
-    try:
-        raw = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-        return [MatchRecord(**r) for r in raw]
-    except Exception:
-        return []
+    # Auto-migrate on first access
+    _migrate()
+    return [_file_to_record(mf) for mf in load_all_matches()]
 
 
 def save_history(records: list[MatchRecord]) -> None:
-    HISTORY_FILE.write_text(
-        json.dumps([r.model_dump() for r in records], default=str, indent=2),
-        encoding="utf-8",
-    )
+    # No-op: individual files are saved by the matches module directly.
+    pass
 
 
 def record_prediction(
@@ -37,66 +54,75 @@ def record_prediction(
     our_lineup: dict[str, list[str]],
     opponent_lineup: dict[str, list[str]],
 ) -> MatchRecord:
-    """Save a new prediction to history and return the record."""
-    us_wins = sum(1 for p in analysis.predictions if p.predicted_winner.lower() == "us")
-    them_wins = len(analysis.predictions) - us_wins
-    overall = "win" if us_wins > them_wins else ("loss" if them_wins > us_wins else "unknown")
-
-    record = MatchRecord(
-        id=str(uuid.uuid4())[:8],
-        recorded_at=datetime.datetime.now().isoformat(),
-        match_date=analysis.match.date,
-        opponent=analysis.match.away_team or analysis.match.home_team,
-        our_lineup=our_lineup,
-        opponent_lineup=opponent_lineup,
-        predictions=analysis.predictions,
-        overall_predicted=overall,
-    )
-
-    records = load_history()
-    records.append(record)
-    save_history(records)
-    return record
+    mf = save_from_analysis(analysis, our_lineup, opponent_lineup)
+    return _file_to_record(mf)
 
 
 def update_result(record_id: str, actual_results: list[CourtResult]) -> Optional[MatchRecord]:
-    """Fill in actual court results for a past prediction record."""
-    records = load_history()
-    for r in records:
-        if r.id == record_id:
-            r.actual_results = actual_results
-            us_wins = sum(1 for c in actual_results if c.winner.lower() == "us")
-            them_wins = sum(1 for c in actual_results if c.winner.lower() == "them")
-            r.overall_actual = "win" if us_wins > them_wins else "loss"
-            save_history(records)
-            return r
-    return None
+    mf = record_actual_results(record_id, actual_results)
+    return _file_to_record(mf) if mf else None
 
 
 def get_recent_records(n: int = 5) -> list[MatchRecord]:
-    """Return the n most recent records that have actual results recorded."""
-    records = load_history()
-    completed = [r for r in records if r.actual_results]
-    return completed[-n:]
+    return [_file_to_record(mf) for mf in get_recent_completed(n)]
 
 
 def format_history_for_prompt(records: list[MatchRecord]) -> str:
-    """Format recent match history compactly for the agent prompt."""
     if not records:
         return ""
-
     lines = ["Past predictions vs actuals:"]
     for r in records:
         date_str = str(r.match_date) if r.match_date else r.recorded_at[:10]
-        lines.append(f"{date_str} vs {r.opponent} (predicted {r.overall_predicted}, actual {r.overall_actual or '?'})")
+        lines.append(
+            f"{date_str} vs {r.opponent} (predicted {r.overall_predicted}, actual {r.overall_actual or '?'})"
+        )
         for pred in r.predictions:
             actual = next(
-                (a for a in r.actual_results if a.court == pred.court and a.court_type == pred.court_type),
+                (a for a in r.actual_results
+                 if a.court == pred.court and a.court_type == pred.court_type),
                 None,
             )
-            ok = "✓" if actual and actual.winner.lower() == pred.predicted_winner.lower() else ("✗" if actual else "?")
-            lines.append(
-                f"  {ok} C{pred.court}{pred.court_type[0]}: pred={pred.predicted_winner}, actual={actual.winner if actual else '?'}"
+            ok = "✓" if actual and actual.winner.lower() == pred.predicted_winner.lower() else (
+                "✗" if actual else "?"
             )
-
+            lines.append(
+                f"  {ok} C{pred.court}{pred.court_type[0]}: "
+                f"pred={pred.predicted_winner}, actual={actual.winner if actual else '?'}"
+            )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Stats helpers (used by agent.py run_lineup_suggestion)
+# ---------------------------------------------------------------------------
+
+def get_player_stats() -> dict[str, dict]:
+    from tennisai.modules.players.store import load_all_players
+    result: dict[str, dict] = {}
+    for pf in load_all_players():
+        result[pf.name] = {
+            "matches_played": pf.matches_played,
+            "singles_wins": pf.singles_wins,
+            "singles_losses": pf.singles_losses,
+            "doubles_wins": pf.doubles_wins,
+            "doubles_losses": pf.doubles_losses,
+            "by_court": {c.court_key: {"wins": c.wins, "losses": c.losses} for c in pf.by_court},
+            "partners": {p.name: {"wins": p.wins, "losses": p.losses} for p in pf.best_partners},
+        }
+    return result
+
+
+def get_season_context() -> dict:
+    matches = load_all_matches()
+    total = len(matches)
+    completed = sum(1 for m in matches if m.actual_results)
+    participation: dict[str, int] = {}
+    for m in matches:
+        for players in m.our_lineup.values():
+            for p in players:
+                participation[p] = participation.get(p, 0) + 1
+    return {
+        "total_recorded_matches": total,
+        "completed_matches": completed,
+        "player_participation": participation,
+    }
