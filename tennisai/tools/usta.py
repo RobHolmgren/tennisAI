@@ -926,7 +926,7 @@ def _parse_scorecard(html: str) -> list[tuple[tuple[int, str], bool]]:
 
     soup = BeautifulSoup(html, "html.parser")
     results: list[tuple[tuple[int, str], bool]] = []
-    our_team_fragment = "long shots"
+    our_team_fragment = get_my_team_name().lower()
 
     # USTA scorecards use tables with rows per court
     # Typical columns: Court | Player1 | Player2 | Score | Result

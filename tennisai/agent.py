@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any, Optional
 
-from tennisai.config import get_ai_provider, get_groq_api_key, get_anthropic_api_key, get_scoring_format
+from tennisai.config import get_ai_provider, get_groq_api_key, get_anthropic_api_key, get_gemini_api_key, get_ollama_base_url, get_ollama_model, get_scoring_format
 from tennisai.models import CourtPrediction, Match, MatchAnalysis, Player, Team
 from tennisai.tools.history import get_player_stats, get_season_context
 from tennisai.tools.tennisrecord import get_league_teams, get_player_history, get_team_ratings
@@ -20,6 +20,7 @@ from tennisai.tools.usta import USTAClient
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 CLAUDE_MODEL = "claude-sonnet-4-6"
+GEMINI_MODEL = "gemini-2.0-flash"
 MAX_ITERATIONS = 10
 
 
@@ -141,6 +142,9 @@ _CLAUDE_TOOLS = [
     for f in _TOOL_FUNCTIONS
 ]
 
+# Gemini format: a single Tool object with a list of function declarations
+_GEMINI_TOOLS = [{"function_declarations": _TOOL_FUNCTIONS}]
+
 
 # ---------------------------------------------------------------------------
 # Tool dispatcher (shared)
@@ -219,17 +223,27 @@ def _build_system_prompt() -> str:
 _SYSTEM_PROMPT = _build_system_prompt()
 
 _OUTPUT_SCHEMA = (
-    "Return JSON only — no prose outside the JSON block:\n"
+    "Return ONLY a JSON object. JSON rules: double-quotes for all strings and keys, "
+    "square brackets [] for every array (never parentheses or curly braces), "
+    "no trailing commas, no comments.\n\n"
     "{\n"
-    '  "match": {"date": "YYYY-MM-DD", "home_team": "", "away_team": "", "location": ""},\n'
-    '  "my_team": {"name": "", "url": "", "players": [{"name": "", "ntrp_level": 3.0, "rating": 2.94}]},\n'
-    '  "opponent_team": {"name": "", "url": "", "players": [{"name": "", "ntrp_level": 3.0, "rating": 2.98}]},\n'
+    '  "match": {"date": null, "home_team": "", "away_team": "", "location": ""},\n'
+    '  "my_team": {"name": "", "url": ""},\n'
+    '  "opponent_team": {"name": "", "url": ""},\n'
     '  "predictions": [\n'
-    '    {"court": 1, "court_type": "Singles", "my_players": [""], "opponent_players": [""],\n'
-    '     "predicted_winner": "us", "predicted_score": "6-3 6-2", "confidence": "high", "reasoning": ""}\n'
+    '    {\n'
+    '      "court": 1,\n'
+    '      "court_type": "Singles",\n'
+    '      "my_players": ["Player A"],\n'
+    '      "opponent_players": ["Player B"],\n'
+    '      "predicted_winner": "us",\n'
+    '      "predicted_score": "6-3 6-2",\n'
+    '      "confidence": "high",\n'
+    '      "reasoning": "one sentence"\n'
+    '    }\n'
     "  ],\n"
-    '  "overall_outlook": "",\n'
-    '  "lineup_suggestions": [""]\n'
+    '  "overall_outlook": "one paragraph",\n'
+    '  "lineup_suggestions": ["suggestion 1", "suggestion 2"]\n'
     "}"
 )
 
@@ -398,6 +412,129 @@ def _run_claude(
 
 
 # ---------------------------------------------------------------------------
+# Ollama agent loop (OpenAI-compatible, no API key needed)
+# ---------------------------------------------------------------------------
+
+def _run_ollama(
+    my_team_url: str,
+    usta_team_url: str,
+    lineup: dict[str, list[str]],
+    opponent_lineup: dict[str, list[str]],
+    history_text: str,
+    singles_courts: int,
+    doubles_courts: int,
+) -> MatchAnalysis:
+    from openai import OpenAI
+
+    client = OpenAI(base_url=get_ollama_base_url(), api_key="ollama")
+    model = get_ollama_model()
+    messages: list[dict] = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": _build_user_message(
+            my_team_url, usta_team_url, lineup, opponent_lineup,
+            history_text, singles_courts, doubles_courts,
+        )},
+    ]
+
+    for _ in range(MAX_ITERATIONS):
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=_GROQ_TOOLS,
+            tool_choice="auto",
+        )
+
+        message = response.choices[0].message
+        messages.append(message)
+
+        if not message.tool_calls:
+            return _parse_final_response(message.content or "", my_team_url, usta_team_url)
+
+        for tool_call in message.tool_calls:
+            try:
+                result = _dispatch_tool(
+                    tool_call.function.name,
+                    json.loads(tool_call.function.arguments),
+                )
+            except Exception as exc:
+                result = json.dumps({"error": str(exc)})
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
+
+    raise RuntimeError("Agent exceeded maximum iterations without producing a final answer.")
+
+
+# ---------------------------------------------------------------------------
+# Gemini agent loop
+# ---------------------------------------------------------------------------
+
+def _run_gemini(
+    my_team_url: str,
+    usta_team_url: str,
+    lineup: dict[str, list[str]],
+    opponent_lineup: dict[str, list[str]],
+    history_text: str,
+    singles_courts: int,
+    doubles_courts: int,
+) -> MatchAnalysis:
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=get_gemini_api_key())
+    user_msg = _build_user_message(
+        my_team_url, usta_team_url, lineup, opponent_lineup,
+        history_text, singles_courts, doubles_courts,
+    )
+    contents: list[dict] = [{"role": "user", "parts": [{"text": user_msg}]}]
+    config = types.GenerateContentConfig(
+        system_instruction=_SYSTEM_PROMPT,
+        tools=_GEMINI_TOOLS,
+        max_output_tokens=4096,
+    )
+
+    for _ in range(MAX_ITERATIONS):
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=config,
+        )
+
+        parts = response.candidates[0].content.parts
+        model_parts: list[dict] = []
+        tool_calls: list = []
+
+        for part in parts:
+            if hasattr(part, "function_call") and part.function_call:
+                fc = part.function_call
+                model_parts.append({"function_call": {"name": fc.name, "args": dict(fc.args)}})
+                tool_calls.append(fc)
+            elif hasattr(part, "text") and part.text:
+                model_parts.append({"text": part.text})
+
+        contents.append({"role": "model", "parts": model_parts})
+
+        if not tool_calls:
+            text = next((p["text"] for p in model_parts if "text" in p), "")
+            return _parse_final_response(text, my_team_url, usta_team_url)
+
+        result_parts: list[dict] = []
+        for fc in tool_calls:
+            try:
+                result = _dispatch_tool(fc.name, dict(fc.args))
+            except Exception as exc:
+                result = json.dumps({"error": str(exc)})
+            result_parts.append({
+                "function_response": {"name": fc.name, "response": {"result": result}}
+            })
+        contents.append({"role": "user", "parts": result_parts})
+
+    raise RuntimeError("Agent exceeded maximum iterations without producing a final answer.")
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -416,8 +553,12 @@ def run_analysis(
         return _run_groq(my_team_url, usta_team_url, lineup, opp, history_text, singles_courts, doubles_courts)
     if provider == "claude":
         return _run_claude(my_team_url, usta_team_url, lineup, opp, history_text, singles_courts, doubles_courts)
+    if provider == "gemini":
+        return _run_gemini(my_team_url, usta_team_url, lineup, opp, history_text, singles_courts, doubles_courts)
+    if provider == "ollama":
+        return _run_ollama(my_team_url, usta_team_url, lineup, opp, history_text, singles_courts, doubles_courts)
     raise NotImplementedError(
-        f"AI provider '{provider}' is not implemented. Supported: 'groq', 'claude'."
+        f"AI provider '{provider}' is not implemented. Supported: 'groq', 'claude', 'gemini', 'ollama'."
     )
 
 
@@ -524,12 +665,64 @@ def run_analysis_direct(
         final_text = next((b.text for b in response.content if hasattr(b, "text")), "")
         return _parse_final_response(final_text, "", "")
 
+    if provider == "gemini":
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=get_gemini_api_key())
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[{"role": "user", "parts": [{"text": prompt}]}],
+            config=types.GenerateContentConfig(
+                system_instruction=_SYSTEM_PROMPT,
+                max_output_tokens=4096,
+            ),
+        )
+        parts = response.candidates[0].content.parts if response.candidates else []
+        final_text = next((p.text for p in parts if hasattr(p, "text") and p.text), "")
+        return _parse_final_response(final_text, "", "")
+
+    if provider == "ollama":
+        from openai import OpenAI
+        client = OpenAI(base_url=get_ollama_base_url(), api_key="ollama")
+        response = client.chat.completions.create(
+            model=get_ollama_model(),
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=4096,
+        )
+        return _parse_final_response(response.choices[0].message.content or "", "", "")
+
     raise NotImplementedError(f"AI provider '{provider}' is not implemented.")
 
 
 # ---------------------------------------------------------------------------
 # Response parser (shared)
 # ---------------------------------------------------------------------------
+
+def _repair_json(raw: str) -> str:
+    """Fix common JSON formatting mistakes produced by small LLMs."""
+    # Rule order matters: absorb stray items back into arrays BEFORE stripping parens.
+
+    # 1. Quoted string sitting outside its array: ],("name") or ]("name") → ,"name"]
+    raw = re.sub(r'\]\s*,?\s*\("([^"]*?)"\)', r', "\1"]', raw)
+    # 2. Mismatched brackets wrapping a quoted string: ("name"}, {"name"), etc.
+    #    Only fires when opening is ( or { — valid ["name"] is untouched.
+    raw = re.sub(r'[({]\s*("(?:[^"\\]|\\.)*?")\s*[)}\]]', r'\1', raw)
+    # 3. Mixed-quote keys: "key': or 'key":
+    raw = re.sub(r'"([A-Za-z_][A-Za-z_0-9]*)\'\s*:', r'"\1":', raw)
+    raw = re.sub(r"'([A-Za-z_][A-Za-z_0-9]*)\"?\s*:", r'"\1":', raw)
+    # 4. Set literal used for lineup_suggestions: {"str", ...} → ["str", ...]
+    raw = re.sub(
+        r'("lineup_suggestions"\s*:\s*)\{([^{}]*)\}',
+        lambda m: m.group(1) + '[' + m.group(2) + ']',
+        raw,
+    )
+    # 5. Trailing commas before } or ]
+    raw = re.sub(r',(\s*[}\]])', r'\1', raw)
+    return raw
+
 
 def _parse_final_response(text: str, my_team_url: str, usta_team_url: str) -> MatchAnalysis:
     json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
@@ -542,15 +735,19 @@ def _parse_final_response(text: str, my_team_url: str, usta_team_url: str) -> Ma
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return MatchAnalysis(
-            match=Match(home_team="Unknown", away_team="Unknown"),
-            my_team=Team(name="My Team", url=my_team_url),
-            opponent_team=Team(name="Opponent", url=""),
-            overall_outlook=text,
-        )
+        raw = _repair_json(raw)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return MatchAnalysis(
+                match=Match(home_team="Unknown", away_team="Unknown"),
+                my_team=Team(name="My Team", url=my_team_url),
+                opponent_team=Team(name="Opponent", url=""),
+                overall_outlook=text,
+            )
 
     match_data = data.get("match", {})
-    raw_date = match_data.get("date")
+    raw_date = match_data.get("date") or None
     # Reject LLM-hallucinated past dates — only accept future/today dates
     if raw_date:
         try:
@@ -566,14 +763,33 @@ def _parse_final_response(text: str, my_team_url: str, usta_team_url: str) -> Ma
         location=match_data.get("location", ""),
     )
 
+    def _coerce_player(p: dict) -> Player:
+        rating = p.get("rating")
+        if isinstance(rating, dict):
+            rating = rating.get("TR") or next(
+                (v for v in rating.values() if isinstance(v, (int, float))), None
+            )
+        return Player(
+            name=p.get("name", ""),
+            ntrp_level=p.get("ntrp_level") if isinstance(p.get("ntrp_level"), (int, float, type(None))) else None,
+            rating=rating if isinstance(rating, (int, float, type(None))) else None,
+            profile_url=p.get("profile_url", ""),
+        )
+
     def _build_team(t: dict, fallback_url: str) -> Team:
         return Team(
             name=t.get("name", ""),
             url=t.get("url", fallback_url),
-            players=[Player(**p) for p in t.get("players", [])],
+            players=[_coerce_player(p) for p in t.get("players", [])],
         )
 
-    predictions = [CourtPrediction(**p) for p in data.get("predictions", [])]
+    raw_predictions = data.get("predictions", [])
+    predictions = []
+    for p in raw_predictions:
+        try:
+            predictions.append(CourtPrediction(**p))
+        except Exception:
+            pass
     predictions = [_fix_predicted_winner(p) for p in predictions]
 
     return MatchAnalysis(

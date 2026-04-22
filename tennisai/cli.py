@@ -35,6 +35,48 @@ def _resolve_usta_url(option_value: Optional[str]) -> str:
         return option_value
     return get_usta_team_url()
 
+
+def _enrich_opponent_players(players, our_player_names: set) -> None:
+    """
+    Create/update player files for opponent players with tennisrecord ratings and WTN.
+    Skips players already on our roster. Only fetches WTN for players missing it.
+    """
+    from tennisai.modules.players.models import PlayerFile
+    from tennisai.modules.players.store import load_player, save_player
+    from tennisai.tools.usta_wtn import fetch_wtn_batch
+
+    opp_players = [p for p in players if p.name not in our_player_names]
+    if not opp_players:
+        return
+
+    # Save tennisrecord ratings first so player files exist before WTN fetch
+    for p in opp_players:
+        pf = load_player(p.name) or PlayerFile(name=p.name)
+        pf.tennisrecord_rating = p.rating or pf.tennisrecord_rating
+        pf.ntrp_level = p.ntrp_level or pf.ntrp_level
+        pf.profile_url = p.profile_url or pf.profile_url
+        save_player(pf)
+
+    # Fetch WTN only for players who don't already have it
+    missing = [
+        p.name for p in opp_players
+        if (pf := load_player(p.name)) is None
+        or (pf.wtn_singles is None and pf.wtn_doubles is None)
+    ]
+    if missing:
+        click.echo(f"Fetching WTN ratings for {len(missing)} opponent player(s)...")
+        wtn_results = fetch_wtn_batch(missing)
+        for name, wtn in wtn_results.items():
+            pf = load_player(name)
+            if not pf:
+                continue
+            if wtn.get("singles") is not None:
+                pf.wtn_singles = wtn["singles"]
+            if wtn.get("doubles") is not None:
+                pf.wtn_doubles = wtn["doubles"]
+            save_player(pf)
+
+
 def _pick_match(usta_url: str) -> dict:
     """
     Let the user pick a match: upcoming matches + past matches within 3 months.
@@ -223,21 +265,18 @@ def _print_analysis(analysis: MatchAnalysis) -> None:
     if m.location:
         click.echo(f"Location: {m.location}")
 
-    our_team_name = analysis.my_team.name or "Us"
-    opp_team_name = analysis.opponent_team.name or "Them"
-
     if analysis.predictions:
         click.echo("\n--- Court Predictions ---")
         for pred in analysis.predictions:
             players_us = ", ".join(pred.my_players) or "TBD"
             players_them = ", ".join(pred.opponent_players) or "TBD"
-            winner_name = our_team_name if pred.predicted_winner.lower() == "us" else opp_team_name
+            winner_label = f"Us ({players_us})" if pred.predicted_winner.lower() == "us" else f"Them ({players_them})"
             score_str = f"  {pred.predicted_score}" if pred.predicted_score else ""
             click.echo(
                 f"\nCourt {pred.court} {pred.court_type}"
                 f"\n  Us:               {players_us}"
                 f"\n  Them:             {players_them}"
-                f"\n  Predicted winner: {winner_name}{score_str} ({pred.confidence} confidence)"
+                f"\n  Predicted winner: {winner_label}{score_str} ({pred.confidence} confidence)"
                 f"\n  Why:              {pred.reasoning}"
             )
 
@@ -371,10 +410,28 @@ def analyze(team_url: Optional[str], usta_url: Optional[str], output_csv: Option
                 opp_team = get_team_ratings(opp_team_obj.url)
                 opponent_roster = [p.name for p in opp_team.players
                                    if p.name not in our_player_names]
+                _enrich_opponent_players(opp_team.players, our_player_names)
         except Exception:
             pass
 
         opponent_lineup = _collect_opponent_lineup(opponent_roster, court_slots)
+
+        # When opponent lineup is unknown but we have their roster, predict it using
+        # the optimizer + LLM so the reliable direct analysis path can be used.
+        if not opponent_lineup and opponent_roster:
+            click.echo("\nPredicting opponent lineup from their roster...")
+            from tennisai.modules.lineup.predictor import predict_lineup
+            opp_result = predict_lineup(
+                available_players=opponent_roster,
+                singles_courts=singles,
+                doubles_courts=doubles,
+                opponent_name=opp_name,
+                team_label=f"opponent ({opp_name})",
+            )
+            opponent_lineup = opp_result["lineup"]
+            click.echo("\n--- Predicted opponent lineup ---")
+            for label, players in opponent_lineup.items():
+                click.echo(f"  {label}: {', '.join(players) if players else 'TBD'}")
 
         history_text = format_history_for_prompt(get_recent_records(3))
         click.echo("\nAnalyzing match... (this may take a moment)")
@@ -858,20 +915,25 @@ def update_players(team_url: Optional[str], with_conclusions: bool, with_wtn: bo
     players = rebuild_from_matches()
     click.echo(f"  Updated {len(players)} player file(s).")
 
-    # Enrich with latest tennisrecord.com ratings
+    # Enrich with latest tennisrecord.com ratings — create files for new players too
     try:
         click.echo("Fetching latest ratings from tennisrecord.com...")
+        from tennisai.modules.players.models import PlayerFile
         from tennisai.modules.players.store import load_player, save_player
         team = get_team_ratings(team_url)
+        created = 0
         for p in team.players:
             pf = load_player(p.name)
-            if pf:
-                pf.tennisrecord_rating = p.rating or pf.tennisrecord_rating
-                pf.ntrp_level = p.ntrp_level or pf.ntrp_level
-                pf.profile_url = p.profile_url or pf.profile_url
-                pf.team = team.name
-                save_player(pf)
-        click.echo(f"  Ratings refreshed for {len(team.players)} player(s).")
+            if not pf:
+                pf = PlayerFile(name=p.name)
+                created += 1
+            pf.tennisrecord_rating = p.rating or pf.tennisrecord_rating
+            pf.ntrp_level = p.ntrp_level or pf.ntrp_level
+            pf.profile_url = p.profile_url or pf.profile_url
+            pf.team = team.name
+            save_player(pf)
+        action = f"created {created} new, updated {len(team.players) - created} existing"
+        click.echo(f"  {action} player file(s).")
     except Exception as exc:
         click.echo(f"  Could not fetch ratings: {exc}")
 

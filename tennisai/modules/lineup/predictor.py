@@ -6,12 +6,13 @@ Works for both our team and the opponent.
 import json
 import re
 
-from tennisai.config import get_ai_provider, get_groq_api_key, get_anthropic_api_key
+from tennisai.config import get_ai_provider, get_groq_api_key, get_anthropic_api_key, get_gemini_api_key, get_ollama_base_url, get_ollama_model
 from tennisai.modules.lineup.optimizer import assign_courts
 from tennisai.modules.players.store import load_player
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 CLAUDE_MODEL = "claude-sonnet-4-6"
+GEMINI_MODEL = "gemini-2.0-flash"
 
 
 def _call_llm(prompt: str, max_tokens: int = 1024) -> str:
@@ -34,6 +35,26 @@ def _call_llm(prompt: str, max_tokens: int = 1024) -> str:
             messages=[{"role": "user", "content": prompt}],
         )
         return resp.content[0].text if resp.content else ""
+    if provider == "gemini":
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=get_gemini_api_key())
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(max_output_tokens=max_tokens),
+        )
+        parts = resp.candidates[0].content.parts if resp.candidates else []
+        return next((p.text for p in parts if hasattr(p, "text") and p.text), "")
+    if provider == "ollama":
+        from openai import OpenAI
+        client = OpenAI(base_url=get_ollama_base_url(), api_key="ollama")
+        resp = client.chat.completions.create(
+            model=get_ollama_model(),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content or ""
     raise NotImplementedError(f"Provider '{provider}' not supported.")
 
 

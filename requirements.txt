@@ -1,5 +1,7 @@
 groq
 anthropic
+google-genai
+openai
 click
 requests
 beautifulsoup4

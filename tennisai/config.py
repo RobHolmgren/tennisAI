@@ -24,6 +24,18 @@ def get_anthropic_api_key() -> str:
     return _require("ANTHROPIC_API_KEY")
 
 
+def get_gemini_api_key() -> str:
+    return _require("GEMINI_API_KEY")
+
+
+def get_ollama_base_url() -> str:
+    return os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+
+
+def get_ollama_model() -> str:
+    return os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
+
 def get_usta_credentials() -> tuple[str, str]:
     return _require("USTA_USERNAME"), _require("USTA_PASSWORD")
 
