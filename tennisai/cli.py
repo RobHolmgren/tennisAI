@@ -325,8 +325,13 @@ def _write_csv(analysis: MatchAnalysis, path: str) -> None:
 
 
 @click.group()
-def cli() -> None:
+@click.pass_context
+def cli(ctx: click.Context) -> None:
     """TennisAI — AI-powered USTA match analysis."""
+    # Skip env validation for help, version, and the test-config command itself
+    if ctx.invoked_subcommand not in (None, "help") and "--help" not in sys.argv:
+        from tennisai.precheck import validate_env
+        validate_env()
 
 
 @cli.command()
@@ -669,7 +674,7 @@ def suggest_lineup(team_url: Optional[str], usta_url: Optional[str], team_num: O
             sys.exit(1)
         click.echo(f"\n  {len(available)} players selected: {', '.join(available)}")
 
-        # --- Step 2: Predict opponent lineup + optionally our lineup ---
+        # --- Step 3: Predict opponent lineup + optionally our lineup ---
         click.echo("\nFetching opponent data and generating lineup recommendation... (this may take a moment)")
         suggestion = run_lineup_suggestion(
             my_team_url=team_url,
@@ -677,6 +682,7 @@ def suggest_lineup(team_url: Optional[str], usta_url: Optional[str], team_num: O
             available_players=available,
             singles_courts=singles,
             doubles_courts=doubles,
+            opponent_name=opp_name,
         )
 
         has_real_opponents = suggestion["has_real_opponents"]

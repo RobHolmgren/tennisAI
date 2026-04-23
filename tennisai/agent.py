@@ -861,10 +861,13 @@ def run_lineup_suggestion(
     available_players: list[str],
     singles_courts: int = 2,
     doubles_courts: int = 3,
+    opponent_name: str = "",
 ) -> dict:
     """
     Recommend an optimal lineup from available players and predict the opponent lineup.
     Returns a structured dict with our_lineup, opponent_lineup, reasoning, rotation_notes, etc.
+    opponent_name should be passed from the match the user selected in the CLI — if omitted,
+    falls back to the first upcoming match from USTA (legacy behaviour).
     """
     from tennisai.modules.lineup.predictor import predict_lineup
     from tennisai.modules.players.store import rebuild_from_matches
@@ -874,24 +877,27 @@ def run_lineup_suggestion(
 
     season = get_season_context()
 
-    # Fetch opponent via USTA
+    # Fetch standings for lineup optimisation context.
+    # Only re-derive opponent_name from USTA schedule when not provided by the caller.
     client = USTAClient()
-    upcoming, _ = client.get_schedule_and_results(usta_team_url)
+    if not opponent_name:
+        upcoming, _ = client.get_schedule_and_results(usta_team_url)
+        today = datetime.date.today()
+        next_match = next((m for m in upcoming if m.date and m.date >= today), None)
+        our_team_obj = get_team_ratings(my_team_url)
+        if next_match:
+            our_name = our_team_obj.name.lower()
+            opponent_name = (
+                next_match.away_team
+                if our_name[:8] in (next_match.home_team or "").lower()
+                else next_match.home_team
+            ) or ""
+    else:
+        our_team_obj = get_team_ratings(my_team_url)
     standings = client.get_standings(usta_team_url)
     client.close()
 
-    today = datetime.date.today()
-    next_match = next((m for m in upcoming if m.date and m.date >= today), None)
-    opponent_name = ""
-    our_team_obj = get_team_ratings(my_team_url)
     our_full_roster: set[str] = {p.name for p in our_team_obj.players}
-    if next_match:
-        our_name = our_team_obj.name.lower()
-        opponent_name = (
-            next_match.away_team
-            if our_name[:8] in (next_match.home_team or "").lower()
-            else next_match.home_team
-        ) or ""
 
     # season and standings are passed through to predict_lineup
 
