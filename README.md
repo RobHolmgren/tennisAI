@@ -165,6 +165,8 @@ python -m tennisai analyze --team-url "https://..." --usta-url "https://..."
 | `accuracy` | Show prediction accuracy stats |
 | `update-players` | Rebuild player files from match history |
 | `update-wtn` | Fetch WTN ratings for all players |
+| `list-teams` | List all configured teams and show which is active |
+| `switch-team <number>` | Switch the active team (persists to `.env`) |
 | `check-tennisrecord` | Test tennisrecord.com scraping |
 | `check-usta` | Test USTA TennisLink login and schedule fetch |
 
@@ -183,23 +185,40 @@ When predicting court outcomes the agent weighs:
 
 ---
 
-## Changing Teams
+## Multiple Teams
 
-To switch to a different USTA team, update these values in `.env`:
+TennisAI supports multiple teams from a single installation. Each team keeps its own match history; player files are shared (useful if you play on more than one team with some of the same players).
+
+### Setup
+
+Add team entries to `.env`:
 
 ```
-MY_TEAM_NAME=Your New Team Name
-MY_TEAM_URL=https://www.tennisrecord.com/adult/teamprofile.aspx?teamname=...
-USTA_TEAM_URL=https://tennislink.usta.com/Leagues/Main/statsandstandings.aspx#&&s=...
+TEAM_COUNT=2
+ACTIVE_TEAM=1
+
+TEAM_1_NAME=My First Team
+TEAM_1_URL=https://www.tennisrecord.com/adult/teamprofile.aspx?teamname=...
+TEAM_1_USTA_URL=https://tennislink.usta.com/Leagues/Main/statsandstandings.aspx#&&s=...
+
+TEAM_2_NAME=My Second Team
+TEAM_2_URL=https://www.tennisrecord.com/adult/teamprofile.aspx?teamname=...
+TEAM_2_USTA_URL=https://tennislink.usta.com/Leagues/Main/statsandstandings.aspx#&&s=...
 ```
 
-Then clear the old team's cached data:
+Match files are stored in team-specific subdirectories (`matches/team-1/`, `matches/team-2/`, …).
+
+### Switching teams
 
 ```bash
-rm matches/*.json        # old match predictions
-rm players/*.json        # old player files
-python -m tennisai update-players   # rebuild for new team
+python -m tennisai list-teams          # show all teams (* = active)
+python -m tennisai switch-team 2       # switch to team 2 (persists to .env)
+python -m tennisai analyze --team 2   # one-off run for team 2 without switching
 ```
+
+### Existing single-team users — no changes needed
+
+If your `.env` uses the original `MY_TEAM_NAME` / `MY_TEAM_URL` / `USTA_TEAM_URL` keys, everything continues to work without any changes. The multi-team keys are optional; the old keys remain supported as a fallback.
 
 ---
 

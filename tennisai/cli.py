@@ -636,6 +636,22 @@ def suggest_lineup(team_url: Optional[str], usta_url: Optional[str], team_num: O
         except Exception:
             roster = []
 
+        # Enrich opponent player files with TR ratings + WTN before analysis
+        try:
+            from tennisai.tools.tennisrecord import get_league_teams
+            our_player_names: set[str] = set(roster)
+            league_teams = get_league_teams(team_url)
+            opp_team_obj = next(
+                (t for t in league_teams
+                 if opp_name.lower()[:8] in t.name.lower() and t.url != team_url),
+                None,
+            )
+            if opp_team_obj:
+                opp_team_data = get_team_ratings(opp_team_obj.url)
+                _enrich_opponent_players(opp_team_data.players, our_player_names)
+        except Exception:
+            pass
+
         click.echo("\n--- Select available players for this match ---")
         if roster:
             for i, name in enumerate(roster, 1):

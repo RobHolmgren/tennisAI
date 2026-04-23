@@ -158,7 +158,8 @@ def predict_lineup(
         f"{standing_note}\n"
         f"{_RATING_SCALE_NOTE}\n"
         f"IMPORTANT: Singles courts numbered 1–{singles_courts}. "
-        f"Doubles courts numbered 1–{doubles_courts} (NOT 3/4/5).\n\n"
+        f"Doubles courts numbered 1–{doubles_courts} (NOT 3/4/5). "
+        f"EACH PLAYER MAY ONLY APPEAR ONCE across all courts — do NOT assign the same player to both a singles and a doubles court.\n\n"
         f"Available players:\n" + "\n".join(stat_lines) + "\n\n"
         f"Initial assignment (from optimizer):\n{lineup_lines}\n\n"
         f"Rotation consideration ({int(season_fraction * 100)}% of season done): {rotation_weight}.\n"
@@ -179,13 +180,27 @@ def predict_lineup(
         data = {}
 
     available_set = set(available_players)
+    used_in_lineup: set[str] = set()
     lineup: dict[str, list[str]] = {}
     per_court_reasoning: dict[str, str] = {}
     for court in data.get("lineup", []):
         label = f"Court {court['court']} {court['court_type']}"
-        players = [p for p in court.get("players", []) if p in available_set]
+        players = [p for p in court.get("players", [])
+                   if p in available_set and p not in used_in_lineup]
         lineup[label] = players
+        used_in_lineup.update(players)
         per_court_reasoning[label] = court.get("reasoning", "")
+
+    # Backfill any court left short by deduplication using players not yet placed
+    for label, players in lineup.items():
+        needed = 2 if "Doubles" in label else 1
+        if len(players) < needed:
+            for p in available_players:
+                if p not in used_in_lineup:
+                    players.append(p)
+                    used_in_lineup.add(p)
+                    if len(players) >= needed:
+                        break
 
     if not lineup:
         lineup = initial
