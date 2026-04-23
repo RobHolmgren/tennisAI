@@ -48,25 +48,20 @@ def predict_match_results(
     if calibration_lines:
         history_text = (history_text + "\nCalibration history:\n" + "\n".join(calibration_lines)).strip()
 
-    if opponent_lineup:
-        from tennisai.agent import run_analysis_direct
-        return run_analysis_direct(
-            lineup=lineup,
-            opponent_lineup=opponent_lineup,
-            history_text=history_text,
-            singles_courts=singles_courts,
-            doubles_courts=doubles_courts,
-            match_date=match_date,
-            opponent_name=opponent_name,
-        )
-
-    from tennisai.agent import run_analysis
-    return run_analysis(
-        my_team_url=my_team_url,
-        usta_team_url=usta_team_url,
+    # Always use the direct (no-tool-call) path. run_analysis_direct handles missing
+    # opponent data gracefully — unknown players show "no rating data" in the prompt.
+    # The full tool-calling agent loop (run_analysis) is avoided because:
+    #   1. It ignores the user's match selection and independently queries USTA for the
+    #      "next" match, which may differ from what was chosen in the CLI.
+    #   2. Local models (Ollama/Llama) produce malformed XML-style function calls that
+    #      fail with a 400 error from the OpenAI-compatible API.
+    from tennisai.agent import run_analysis_direct
+    return run_analysis_direct(
         lineup=lineup,
-        opponent_lineup=None,
+        opponent_lineup=opponent_lineup or {},
         history_text=history_text,
         singles_courts=singles_courts,
         doubles_courts=doubles_courts,
+        match_date=match_date,
+        opponent_name=opponent_name,
     )
