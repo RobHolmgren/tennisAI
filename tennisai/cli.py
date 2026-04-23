@@ -17,7 +17,10 @@ from typing import Optional
 
 import click
 
-from tennisai.config import get_singles_courts_override, get_my_team_url, get_usta_team_url
+from tennisai.config import (
+    get_singles_courts_override, get_my_team_url, get_usta_team_url,
+    get_all_teams, get_active_team_index, set_active_team,
+)
 from tennisai.models import CourtResult, MatchAnalysis
 from tennisai.modules.matches import load_all_matches, load_match
 from tennisai.modules.results import predict_match_results, apply_learnings
@@ -342,9 +345,28 @@ def cli() -> None:
     default=None,
     help="Optional path to save court predictions as a CSV file",
 )
-def analyze(team_url: Optional[str], usta_url: Optional[str], output_csv: Optional[str]) -> None:
+@click.option(
+    "--team",
+    "team_num",
+    type=int,
+    default=None,
+    help="Team number to use for this run (overrides ACTIVE_TEAM; does not persist)",
+)
+def analyze(
+    team_url: Optional[str],
+    usta_url: Optional[str],
+    output_csv: Optional[str],
+    team_num: Optional[int],
+) -> None:
     """Analyze a USTA match and predict court outcomes."""
     try:
+        import os
+        if team_num is not None:
+            os.environ["ACTIVE_TEAM"] = str(team_num)
+
+        from tennisai.config import get_my_team_name
+        click.echo(f"\nTeam: {get_my_team_name()}")
+
         team_url = _resolve_team_url(team_url)
         usta_url = _resolve_usta_url(usta_url)
 
@@ -574,9 +596,18 @@ def check_usta(usta_url: Optional[str], debug: bool) -> None:
 @cli.command("suggest-lineup")
 @click.option("--team-url", default=None, help="tennisrecord.com team URL (defaults to MY_TEAM_URL in .env)")
 @click.option("--usta-url", default=None, help="USTA TennisLink URL (defaults to USTA_TEAM_URL in .env)")
-def suggest_lineup(team_url: Optional[str], usta_url: Optional[str]) -> None:
+@click.option("--team", "team_num", type=int, default=None,
+              help="Team number to use for this run (overrides ACTIVE_TEAM; does not persist)")
+def suggest_lineup(team_url: Optional[str], usta_url: Optional[str], team_num: Optional[int]) -> None:
     """Predict opponent lineup, optionally suggest ours, then run match analysis."""
     try:
+        import os
+        if team_num is not None:
+            os.environ["ACTIVE_TEAM"] = str(team_num)
+
+        from tennisai.config import get_my_team_name
+        click.echo(f"\nTeam: {get_my_team_name()}")
+
         team_url = _resolve_team_url(team_url)
         usta_url = _resolve_usta_url(usta_url)
 
@@ -1318,6 +1349,61 @@ def accuracy() -> None:
             click.echo(f"  {name:<30} {stats['correct']}/{stats['total']} ({pct}%)")
 
     click.echo("=" * 60 + "\n")
+
+
+@cli.command("list-teams")
+def list_teams() -> None:
+    """List all configured teams and show which one is active."""
+    teams = get_all_teams()
+    active = get_active_team_index()
+
+    if not teams:
+        click.echo("No teams configured. Set TEAM_COUNT and TEAM_N_NAME/URL/USTA_URL in .env.")
+        return
+
+    click.echo("\n--- Configured teams ---")
+    for t in teams:
+        marker = "*" if t["index"] == active else " "
+        name = t["name"] or f"Team {t['index']}"
+        click.echo(f"  [{marker}] {t['index']}. {name}")
+    click.echo()
+    click.echo("Use 'switch-team <number>' to change the active team.")
+
+
+@cli.command("switch-team")
+@click.argument("team_num", required=False, type=int)
+def switch_team(team_num: Optional[int]) -> None:
+    """Switch the active team (persists to .env)."""
+    teams = get_all_teams()
+    active = get_active_team_index()
+
+    if not teams:
+        click.echo("No teams configured.", err=True)
+        sys.exit(1)
+
+    click.echo("\n--- Configured teams ---")
+    for t in teams:
+        marker = "*" if t["index"] == active else " "
+        name = t["name"] or f"Team {t['index']}"
+        click.echo(f"  [{marker}] {t['index']}. {name}")
+    click.echo()
+
+    if team_num is None:
+        raw = click.prompt("Switch to team number").strip()
+        if not raw.isdigit():
+            click.echo("Invalid team number.", err=True)
+            sys.exit(1)
+        team_num = int(raw)
+
+    valid = [t["index"] for t in teams]
+    if team_num not in valid:
+        click.echo(f"Team {team_num} not found. Valid options: {valid}", err=True)
+        sys.exit(1)
+
+    set_active_team(team_num)
+    new_cfg = next(t for t in teams if t["index"] == team_num)
+    click.echo(f"Switched to team {team_num}: {new_cfg['name'] or f'Team {team_num}'}")
+    click.echo("Run 'analyze' or 'suggest-lineup' to work with this team.")
 
 
 def main() -> None:

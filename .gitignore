@@ -2,8 +2,8 @@
 requirements.md
 new_requirements.md
 .match_history.json
-matches/
-players/
+/matches/
+/players/
 __pycache__/
 *.py[cod]
 *.egg-info/
